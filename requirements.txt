@@ -1,0 +1,24 @@
+# Core Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Segmentation Models
+segmentation-models-pytorch>=0.3.3
+
+# Image Processing & Augmentation
+opencv-python>=4.8.0
+albumentations>=1.3.1
+Pillow>=10.0.0
+
+# Utilities
+numpy>=1.24.0
+tqdm>=4.66.0
+matplotlib>=3.7.0
+
+# Logging & Visualization
+tensorboard>=2.14.0
+
+# Optional: For DICOM image support
+# pydicom>=2.4.0
+# SimpleITK>=2.3.0
