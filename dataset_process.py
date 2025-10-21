@@ -629,8 +629,8 @@ Examples:
     
     # Preprocessing arguments
     preproc = p.add_argument_group('preprocessing options')
-    preproc.add_argument("--use-sigmoid", action="store_true",
-                        help="Use sigmoid (non-linear) normalization instead of linear")
+    preproc.add_argument("--avoid-sigmoid", action="store_false",
+                        help="Avoid sigmoid (non-linear) normalization instead of linear")
     preproc.add_argument("--median-kernel", type=int, default=5,
                         help="Kernel size for median filtering (must be odd, default: 5)")
     preproc.add_argument("--clahe-tile-size", type=int, nargs=2, default=[8, 8],
