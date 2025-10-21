@@ -360,7 +360,7 @@ def process_cbis(input_csv, mask_outdir, image_outdir, preproc_args: dict):
             # Apply comprehensive preprocessing pipeline
             processed_img = preprocess_image(
                 full_img,
-                use_sigmoid=preproc_args['avoid_sigmoid'],
+                use_sigmoid=preproc_args['use_sigmoid'],
                 median_kernel=preproc_args['median_kernel'],
                 clahe_tile_size=tuple(preproc_args['clahe_tile_size']),
                 clahe_delta=preproc_args['clahe_delta']
