@@ -575,12 +575,23 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
                     if not root_matches_category:
                         continue
                     
-                if debug and search_count <= 5:  # Show first few directories searched
+                if debug and search_count <= 10:  # Show first 10 directories searched
                     print(f"  Searching in: {root}")
                     if files:
+                        # Show both image files and mask files to understand directory contents
                         image_files = [f for f in files if f.lower().endswith(('.png', '.jpg', '.jpeg')) and 'mask' not in f.lower()]
+                        mask_files = [f for f in files if f.lower().endswith(('.png', '.jpg', '.jpeg')) and 'mask' in f.lower()]
+                        
                         if image_files:
-                            print(f"    Found non-mask images: {image_files[:3]}")  # Show first 3
+                            print(f"    Non-mask images ({len(image_files)}): {image_files[:3]}")  # Show first 3
+                        if mask_files:
+                            print(f"    Mask files ({len(mask_files)}): {mask_files[:3]}")  # Show first 3
+                        if not image_files and not mask_files:
+                            all_files = [f for f in files if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                            if all_files:
+                                print(f"    All images ({len(all_files)}): {all_files[:3]}")
+                    else:
+                        print(f"    No files found")
                 
                 # First try exact filename match
                 if filename in files:
@@ -808,17 +819,26 @@ def process_datasets(cbis_csv, mini_ddsm_excel, mini_ddsm_base_dir,
     mini_img_dir = os.path.join(outdir, "MINI_IMAGES")
     mini_mask_dir = os.path.join(outdir, "MINI_MASKS")
 
-    ensure_dir(cbis_img_dir)
-    ensure_dir(cbis_mask_dir)
-    ensure_dir(mini_img_dir)
-    ensure_dir(mini_mask_dir)
-
-    print("[INFO] Processing CBIS-DDSM dataset...")
-    cbis_df = process_cbis(cbis_csv, cbis_mask_dir, cbis_img_dir, preproc_args)
+    # Process CBIS-DDSM if provided
+    cbis_df = pd.DataFrame([])
+    if cbis_csv:
+        ensure_dir(cbis_img_dir)
+        ensure_dir(cbis_mask_dir)
+        print("[INFO] Processing CBIS-DDSM dataset...")
+        cbis_df = process_cbis(cbis_csv, cbis_mask_dir, cbis_img_dir, preproc_args)
+    else:
+        print("[INFO] Skipping CBIS-DDSM dataset (not provided)")
     
-    print("[INFO] Processing Mini-DDSM (DataWMask.xlsx) dataset...")
-    mini_df = process_mini_ddsm(mini_ddsm_excel, mini_ddsm_base_dir, mini_mask_dir, mini_img_dir, preproc_args,
-                                contour_columns=["Tumour_Contour", "Tumour_Contour2"], debug=debug)
+    # Process Mini-DDSM if provided
+    mini_df = pd.DataFrame([])
+    if mini_ddsm_excel and mini_ddsm_base_dir:
+        ensure_dir(mini_img_dir)
+        ensure_dir(mini_mask_dir)
+        print("[INFO] Processing Mini-DDSM (DataWMask.xlsx) dataset...")
+        mini_df = process_mini_ddsm(mini_ddsm_excel, mini_ddsm_base_dir, mini_mask_dir, mini_img_dir, preproc_args,
+                                    contour_columns=["Tumour_Contour", "Tumour_Contour2"], debug=debug)
+    else:
+        print("[INFO] Skipping Mini-DDSM dataset (not provided)")
 
     mini2_df = pd.DataFrame([])
     if mini2_excel and mini2_base_dir:
@@ -905,12 +925,12 @@ Examples:
     --use-sigmoid --median-kernel 7 --clahe-delta 0.02
         """)
     
-    # Required arguments
-    p.add_argument("--cbis-csv", type=str, required=True, 
+    # Dataset arguments (at least one dataset must be provided)
+    p.add_argument("--cbis-csv", type=str, required=False, default="",
                    help="Path to CBIS-DDSM CSV file")
-    p.add_argument("--mini-ddsm-excel", type=str, required=True,
+    p.add_argument("--mini-ddsm-excel", type=str, required=False, default="",
                    help="Path to Mini-DDSM DataWMask.xlsx file")
-    p.add_argument("--mini-ddsm-base-dir", type=str, required=True,
+    p.add_argument("--mini-ddsm-base-dir", type=str, required=False, default="",
                    help="Base directory containing Mini-DDSM images (MINI JPEGs)")
     p.add_argument("--mini2-excel", type=str, required=False, default="",
                    help="Path to Data-MoreThanTwoMasks.xlsx file (optional)")
@@ -942,6 +962,44 @@ Examples:
 if __name__ == "__main__":
     args = get_args()
     
+    # Validate that at least one dataset is provided
+    has_cbis = bool(args.cbis_csv)
+    has_mini = bool(args.mini_ddsm_excel and args.mini_ddsm_base_dir)
+    has_mini2 = bool(args.mini2_excel and args.mini2_base_dir)
+    
+    if not (has_cbis or has_mini or has_mini2):
+        print("[ERROR] At least one dataset must be provided:")
+        print("  - CBIS-DDSM: --cbis-csv")
+        print("  - Mini-DDSM: --mini-ddsm-excel + --mini-ddsm-base-dir")
+        print("  - Mini-DDSM MoreThanTwoMasks: --mini2-excel + --mini2-base-dir")
+        exit(1)
+    
+    # Validate that provided files exist
+    if has_cbis and not os.path.exists(args.cbis_csv):
+        print(f"[ERROR] CBIS-DDSM CSV file not found: {args.cbis_csv}")
+        exit(1)
+    
+    if has_mini:
+        if not os.path.exists(args.mini_ddsm_excel):
+            print(f"[ERROR] Mini-DDSM Excel file not found: {args.mini_ddsm_excel}")
+            exit(1)
+        if not os.path.exists(args.mini_ddsm_base_dir):
+            print(f"[ERROR] Mini-DDSM base directory not found: {args.mini_ddsm_base_dir}")
+            exit(1)
+    
+    if has_mini2:
+        if not os.path.exists(args.mini2_excel):
+            print(f"[ERROR] Mini-DDSM MoreThanTwoMasks Excel file not found: {args.mini2_excel}")
+            exit(1)
+        if not os.path.exists(args.mini2_base_dir):
+            print(f"[ERROR] Mini-DDSM MoreThanTwoMasks base directory not found: {args.mini2_base_dir}")
+            exit(1)
+    
+    print(f"[INFO] Processing datasets:")
+    print(f"  - CBIS-DDSM: {'✓' if has_cbis else '✗'}")
+    print(f"  - Mini-DDSM: {'✓' if has_mini else '✗'}")  
+    print(f"  - Mini-DDSM MoreThanTwoMasks: {'✓' if has_mini2 else '✗'}")
+    
     # Validate preprocessing arguments
     if args.clahe_delta <= 0 or args.clahe_delta > 1:
         raise ValueError(f"CLAHE delta (δ) must be in range (0, 1], got {args.clahe_delta}")
@@ -958,15 +1016,18 @@ if __name__ == "__main__":
         'clahe_delta': args.clahe_delta
     }
     
-    # Handle optional mini2 arguments
+    # Handle optional arguments (convert empty strings to None)
+    cbis_csv = args.cbis_csv if args.cbis_csv else None
+    mini_excel = args.mini_ddsm_excel if args.mini_ddsm_excel else None
+    mini_base = args.mini_ddsm_base_dir if args.mini_ddsm_base_dir else None
     mini2_excel = args.mini2_excel if args.mini2_excel else None
     mini2_base = args.mini2_base_dir if args.mini2_base_dir else None
     
     # Process datasets
     process_datasets(
-        args.cbis_csv,
-        args.mini_ddsm_excel,
-        args.mini_ddsm_base_dir,
+        cbis_csv,
+        mini_excel,
+        mini_base,
         mini2_excel,
         mini2_base,
         args.output_csv,
