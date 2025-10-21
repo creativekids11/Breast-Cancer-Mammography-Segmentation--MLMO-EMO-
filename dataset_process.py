@@ -540,14 +540,40 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
                 if debug:
                     print(f"  Expected category: {expected_category}")
             
+            # Check what categories actually exist in the directory
+            available_categories = []
+            if os.path.exists(base_dir):
+                available_categories = [d for d in os.listdir(base_dir) 
+                                      if os.path.isdir(os.path.join(base_dir, d))]
+            
+            # Category mapping for missing categories
+            search_categories = []
+            if expected_category:
+                if expected_category in available_categories:
+                    search_categories = [expected_category]
+                elif expected_category.lower() == 'normal' and 'Normal' not in available_categories:
+                    # If Normal category doesn't exist, search in all available categories
+                    # since Normal images might be stored elsewhere
+                    search_categories = available_categories
+                    if debug:
+                        print(f"  [INFO] 'Normal' category not found. Searching in all available: {available_categories}")
+                else:
+                    search_categories = available_categories
+                    if debug:
+                        print(f"  [INFO] Category '{expected_category}' not found. Searching in: {available_categories}")
+            else:
+                search_categories = available_categories
+            
             # Search in subdirectories of base_dir
             search_count = 0
             for root, dirs, files in os.walk(base_dir):
                 search_count += 1
                 
-                # Skip directories that don't match expected category if we have one
-                if expected_category and expected_category.lower() not in root.lower():
-                    continue
+                # Skip directories that don't match any of our search categories
+                if search_categories:
+                    root_matches_category = any(cat.lower() in root.lower() for cat in search_categories)
+                    if not root_matches_category:
+                        continue
                     
                 if debug and search_count <= 5:  # Show first few directories searched
                     print(f"  Searching in: {root}")
@@ -576,34 +602,58 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
                 if img_path is None:
                     base_name_lower = base_name.lower()
                     # Extract key components from the expected filename
-                    # For A_1865_1.RIGHT_MLO.png -> look for files with RIGHT_MLO pattern
+                    # For D_4607_1.LEFT_CC.png -> look for files with LEFT_CC pattern
                     parts = base_name_lower.split('_')
                     if len(parts) >= 3:
                         # Extract view pattern (like RIGHT_MLO, LEFT_CC)
-                        view_pattern = '_'.join(parts[-2:])  # e.g., "right_mlo"
+                        view_pattern = '_'.join(parts[-2:])  # e.g., "left_cc"
+                        
+                        # Also extract patient ID pattern (like 4607)
+                        patient_id = None
+                        for part in parts:
+                            if part.isdigit() and len(part) >= 4:  # Patient IDs are typically 4+ digits
+                                patient_id = part
+                                break
                         
                         for file in files:
                             file_lower = file.lower()
                             # Skip mask files for now, look for original images
                             if (file_lower.endswith(('.png', '.jpg', '.jpeg')) and 
-                                'mask' not in file_lower and
-                                view_pattern in file_lower):
-                                img_path = os.path.join(root, file)
-                                if debug:
-                                    print(f"  ✓ Found fuzzy match by view pattern: {img_path} (pattern: {view_pattern})")
-                                break
+                                'mask' not in file_lower):
+                                
+                                # Check if file matches view pattern
+                                if view_pattern in file_lower:
+                                    img_path = os.path.join(root, file)
+                                    if debug:
+                                        print(f"  ✓ Found fuzzy match by view pattern: {img_path} (pattern: {view_pattern})")
+                                    break
+                                
+                                # Check if file matches patient ID
+                                if patient_id and patient_id in file_lower:
+                                    img_path = os.path.join(root, file)
+                                    if debug:
+                                        print(f"  ✓ Found fuzzy match by patient ID: {img_path} (ID: {patient_id})")
+                                    break
                     
-                    # If still not found, try broader fuzzy matching
+                    # If still not found, try broader fuzzy matching by filename parts
                     if img_path is None:
                         for file in files:
                             file_lower = file.lower()
                             if (file_lower.endswith(('.png', '.jpg', '.jpeg')) and 
-                                'mask' not in file_lower and
-                                base_name_lower in file_lower):
-                                img_path = os.path.join(root, file)
-                                if debug:
-                                    print(f"  ✓ Found fuzzy match: {img_path} (for {base_name})")
-                                break
+                                'mask' not in file_lower):
+                                
+                                # Check if any significant part of the base name appears in the file
+                                match_score = 0
+                                for part in parts:
+                                    if len(part) >= 3 and part in file_lower:  # Skip very short parts
+                                        match_score += 1
+                                
+                                # If we have at least 2 matching parts, consider it a match
+                                if match_score >= 2:
+                                    img_path = os.path.join(root, file)
+                                    if debug:
+                                        print(f"  ✓ Found fuzzy match by parts: {img_path} (score: {match_score})")
+                                    break
                         
                 if img_path:
                     break
@@ -615,8 +665,11 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
             # Final fallback: if we have an expected category but found no files,
             # warn user about the mismatch and suggest checking data structure
             if img_path is None and expected_category and debug:
-                print(f"  [WARNING] No files found matching pattern in {expected_category} category.")
+                print(f"  [WARNING] No files found matching pattern '{base_name}' in any category.")
+                print(f"  Expected category: {expected_category}, Available categories: {available_categories}")
                 print(f"  This suggests the Excel file references don't match the actual directory structure.")
+                if expected_category == 'Normal' and 'Normal' not in available_categories:
+                    print(f"  Note: 'Normal' category images might be stored in {available_categories}")
                 print(f"  Consider verifying that the Excel file and image directory are correctly paired.")
         
         if img_path is None or not os.path.exists(img_path):
