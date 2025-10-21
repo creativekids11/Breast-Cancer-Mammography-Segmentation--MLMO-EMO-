@@ -1,12 +1,30 @@
 #!/usr/bin/env python3
 """
-Unified dataset prep for CBIS-DDSM and Mini-DDSM.
+Unified dataset prep for CBIS-DDSM, Mini-DDSM, and Mini-DDSM Data-MoreThanTwoMasks.
 
 This version implements comprehensive image preprocessing based on research paper:
  - Linear and non-linear (sigmoid) normalization techniques
  - Median filtering for noise reduction
  - CLAHE (Contrast Limited Adaptive Histogram Equalization) with proper clip limit calculation
- - Processes CBIS-DDSM and Mini-DDSM datasets
+ - Processes CBIS-DDSM, Mini-DDSM (DataWMask.xlsx), and Mini-DDSM Data-MoreThanTwoMasks datasets
+ - Supports multiple mask contours (Tumour_Contour, Tumour_Contour2, Tumour_Contour3)
+ - Merges multiple masks per image into a single binary mask
+
+Behavior:
+ - Comprehensive preprocessing with research-backed techniques
+ - Merges multiple masks per image into a single binary mask
+ - Supports MINI and MINI_MORE (Data-MoreThanTwoMasks) in different base directories
+ - Produces processed images and masks into output subdirectories and writes a unified CSV
+
+Usage example:
+ python dataset_process.py \
+   --cbis-csv /path/to/cbis.csv \
+   --mini-ddsm-excel /path/to/DataWMask.xlsx \
+   --mini-ddsm-base-dir /path/to/MINI_IMAGES_BASE \
+   --mini2-excel /path/to/Data-MoreThanTwoMasks.xlsx \
+   --mini2-base-dir /path/to/MINI2_BASE \
+   --outdir OUTDIR \
+   --output-csv unified.csv --use-sigmoid
 """
 from __future__ import annotations
 import os
@@ -14,12 +32,97 @@ import argparse
 import pandas as pd
 import numpy as np
 import cv2
-from typing import Tuple
+from typing import Tuple, List, Optional
 
 # ---------------- Utilities ---------------- #
 def ensure_dir(dir_path: str):
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
+
+def _normalize_mask_ref(mask_ref: str) -> Optional[str]:
+    """Return None for empty/placeholder tokens, else normalized path string."""
+    if mask_ref is None:
+        return None
+    s = str(mask_ref).strip()
+    if not s or s in ("-", "nan", "None", "NULL"):
+        return None
+    return s
+
+def _split_mask_field(s: str) -> List[str]:
+    """
+    A mask field may contain multiple mask paths separated by
+    ';', '|', ',', or whitespace. Return list of cleaned strings.
+    """
+    if s is None:
+        return []
+    parts = []
+    for token in [p for sep in [';', '|', ','] for p in s.split(sep)]:
+        token = token.strip()
+        if token:
+            parts.append(token)
+    # If above split produced nothing but original has spaces, try whitespace split
+    if not parts and isinstance(s, str):
+        parts = [p for p in s.split() if p]
+    return parts
+
+def _resolve_mask_path(candidate: str, base_dir: str) -> Optional[str]:
+    """
+    Try to resolve a mask candidate path to an existing file.
+    Handles backslashes, leading/trailing slashes, and absolute paths.
+    """
+    if candidate is None:
+        return None
+    cand = candidate.strip()
+    if not cand or cand in ("-", "nan", "None", "NULL"):
+        return None
+
+    # If absolute path and exists
+    if os.path.isabs(cand) and os.path.exists(cand):
+        return cand
+
+    # Try as relative to base_dir (preserve internal backslashes)
+    joined = os.path.join(base_dir, cand)
+    norm = os.path.normpath(joined)
+    if os.path.exists(norm):
+        return norm
+
+    # Try replace backslashes with os.sep pieces
+    cand2 = cand.replace("\\", os.sep).replace("/", os.sep)
+    joined2 = os.path.join(base_dir, cand2)
+    norm2 = os.path.normpath(joined2)
+    if os.path.exists(norm2):
+        return norm2
+
+    # Try only the filename inside base_dir subtree (slow for large bases; we avoid scanning entire tree)
+    # but attempt a sibling check: if candidate looks like "subdir/file.png", try last two components
+    parts = cand.replace("\\", "/").split("/")
+    if len(parts) >= 2:
+        tail = os.path.join(*parts[-2:])
+        cand3 = os.path.join(base_dir, tail)
+        if os.path.exists(cand3):
+            return os.path.normpath(cand3)
+
+    # Not found
+    return None
+
+def _merge_mask_files(mask_paths: List[str], target_shape: tuple) -> np.ndarray:
+    """Read and OR all existing masks in mask_paths; return binary (0/255) mask shaped target_shape."""
+    h, w = target_shape
+    out_mask = np.zeros((h, w), dtype=np.uint8)
+    for mp in mask_paths:
+        if not mp:
+            continue
+        if not os.path.exists(mp):
+            continue
+        m = cv2.imread(mp, cv2.IMREAD_GRAYSCALE)
+        if m is None:
+            continue
+        # Binarize then resize if needed
+        m_bin = (m > 0).astype(np.uint8) * 255
+        if m_bin.shape != (h, w):
+            m_bin = cv2.resize(m_bin, (w, h), interpolation=cv2.INTER_NEAREST)
+        out_mask = cv2.bitwise_or(out_mask, m_bin)
+    return out_mask
 
 # ---------------- Image Denoising & Enhancement Techniques ---------------- #
 
@@ -292,36 +395,47 @@ def process_cbis(input_csv, mask_outdir, image_outdir, preproc_args: dict):
     return pd.DataFrame(rows)
 
 # ---------------- Mini-DDSM processing ---------------- #
-def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_args: dict):
+def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_args: dict,
+                      contour_columns: Optional[List[str]] = None):
     """
     Process Mini-DDSM dataset with comprehensive preprocessing.
+    Supports multiple mask columns (Tumour_Contour, Tumour_Contour2, Tumour_Contour3, etc.)
     
     Args:
-        excel_path: Path to DataWMask.xlsx file
+        excel_path: Path to DataWMask.xlsx or Data-MoreThanTwoMasks.xlsx file
         base_dir: Base directory containing the Mini-DDSM images
         mask_outdir: Output directory for processed masks
         image_outdir: Output directory for processed images
         preproc_args: Dictionary containing preprocessing parameters
+        contour_columns: List of column names to look for masks (e.g. ["Tumour_Contour","Tumour_Contour2"])
+                        If None, defaults to ["Tumour_Contour","Tumour_Contour2"]
     """
+    if contour_columns is None:
+        contour_columns = ["Tumour_Contour", "Tumour_Contour2"]
+    
     ensure_dir(mask_outdir)
     ensure_dir(image_outdir)
     
     # Read the Data sheet from Excel
-    df = pd.read_excel(excel_path, sheet_name="Data")
+    df = pd.read_excel(excel_path, sheet_name="Data") if excel_path.endswith((".xlsx", ".xls")) else pd.read_csv(excel_path)
     rows = []
     
     for idx, row in df.iterrows():
-        img_rel_path = row["fullPath"]
-        img_path = os.path.join(base_dir, img_rel_path)
+        img_rel_path = row.get("fullPath") or row.get("fileName")  # prefer fullPath then fileName
+        if pd.isna(img_rel_path):
+            continue
+        img_rel_path = str(img_rel_path).strip()
+        img_path = os.path.join(base_dir, img_rel_path) if not os.path.isabs(img_rel_path) else img_rel_path
+        img_path = os.path.normpath(img_path)
         
         if not os.path.exists(img_path):
-            print(f"[WARNING] Image not found: {img_path}")
+            print(f"[WARNING] MINI: Image not found: {img_path}")
             continue
         
         # Load and preprocess image
         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if img is None:
-            print(f"[WARNING] Failed to load image: {img_path}")
+            print(f"[WARNING] MINI: Failed to load image: {img_path}")
             continue
         
         # Apply comprehensive preprocessing pipeline
@@ -333,41 +447,42 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
             clahe_delta=preproc_args['clahe_delta']
         )
         
-        # Load mask if available
-        mask = np.zeros_like(processed_img, dtype=np.uint8)
-        tumour_contour = row.get("Tumour_Contour", None)
-        tumour_contour2 = row.get("Tumour_Contour2", None)
+        h, w = processed_img.shape[:2]
         
-        # Check if mask paths are available (not NaN and not "-")
-        if pd.notna(tumour_contour) and str(tumour_contour) != "-":
-            mask_path = os.path.join(base_dir, tumour_contour)
-            if os.path.exists(mask_path):
-                mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-                if mask_img is not None:
-                    mask_img = (mask_img > 0).astype(np.uint8) * 255
-                    if mask_img.shape != processed_img.shape:
-                        mask_img = cv2.resize(mask_img, (processed_img.shape[1], processed_img.shape[0]), 
-                                            interpolation=cv2.INTER_NEAREST)
-                    mask = cv2.bitwise_or(mask, mask_img)
+        # Collect mask candidate strings across provided contour columns
+        mask_candidates = []
+        for col in contour_columns:
+            if col in row:
+                raw = row.get(col)
+                raw = _normalize_mask_ref(raw)
+                if raw:
+                    parts = _split_mask_field(str(raw))
+                    mask_candidates.extend(parts)
         
-        # Check for second mask if available
-        if pd.notna(tumour_contour2) and str(tumour_contour2) != "-":
-            mask_path2 = os.path.join(base_dir, tumour_contour2)
-            if os.path.exists(mask_path2):
-                mask_img2 = cv2.imread(mask_path2, cv2.IMREAD_GRAYSCALE)
-                if mask_img2 is not None:
-                    mask_img2 = (mask_img2 > 0).astype(np.uint8) * 255
-                    if mask_img2.shape != processed_img.shape:
-                        mask_img2 = cv2.resize(mask_img2, (processed_img.shape[1], processed_img.shape[0]), 
-                                             interpolation=cv2.INTER_NEAREST)
-                    mask = cv2.bitwise_or(mask, mask_img2)
+        # Resolve candidate paths into actual existing files
+        resolved_masks = []
+        for cand in mask_candidates:
+            resolved = _resolve_mask_path(cand, base_dir)
+            if resolved:
+                resolved_masks.append(resolved)
+            else:
+                # Try if cand is just filename in same folder as image
+                possible = os.path.join(os.path.dirname(img_path), cand)
+                if os.path.exists(possible):
+                    resolved_masks.append(os.path.normpath(possible))
+                else:
+                    # Not found: continue without warning for cleaner output
+                    pass
+        
+        # Merge masks (if any) using the utility function
+        mask = _merge_mask_files(resolved_masks, (h, w))
         
         # Create unique filename
-        filename = row["fileName"]
+        filename = row.get("fileName") or os.path.basename(img_path)
         basename = os.path.splitext(filename)[0]
-        status = row["Status"]
-        side = row["Side"]
-        view = row["View"]
+        status = row.get("Status", "")
+        side = row.get("Side", "")
+        view = row.get("View", "")
         unique_name = f"MINI_{status}_{basename}"
         
         proc_img_path = os.path.join(image_outdir, f"{unique_name}.png")
@@ -394,14 +509,18 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
     return pd.DataFrame(rows)
 
 # ---------------- Main Processing Function ---------------- #
-def process_datasets(cbis_csv, mini_ddsm_excel, mini_ddsm_base_dir, output_csv, outdir, preproc_args: dict):
+def process_datasets(cbis_csv, mini_ddsm_excel, mini_ddsm_base_dir, 
+                     mini2_excel, mini2_base_dir, output_csv, outdir, preproc_args: dict):
     """
-    Process CBIS-DDSM and Mini-DDSM datasets with comprehensive preprocessing.
+    Process CBIS-DDSM, Mini-DDSM, and optionally Data-MoreThanTwoMasks (mini2) datasets 
+    with comprehensive preprocessing.
     
     Args:
         cbis_csv: Path to CBIS-DDSM CSV file
         mini_ddsm_excel: Path to Mini-DDSM DataWMask.xlsx file
         mini_ddsm_base_dir: Base directory containing Mini-DDSM images
+        mini2_excel: Path to Data-MoreThanTwoMasks.xlsx file (optional)
+        mini2_base_dir: Base directory for Data-MoreThanTwoMasks images/masks (optional)
         output_csv: Output path for unified CSV
         outdir: Output directory for processed images and masks
         preproc_args: Dictionary containing preprocessing parameters
@@ -419,16 +538,38 @@ def process_datasets(cbis_csv, mini_ddsm_excel, mini_ddsm_base_dir, output_csv, 
     print("[INFO] Processing CBIS-DDSM dataset...")
     cbis_df = process_cbis(cbis_csv, cbis_mask_dir, cbis_img_dir, preproc_args)
     
-    print("[INFO] Processing Mini-DDSM dataset...")
-    mini_df = process_mini_ddsm(mini_ddsm_excel, mini_ddsm_base_dir, mini_mask_dir, mini_img_dir, preproc_args)
+    print("[INFO] Processing Mini-DDSM (DataWMask.xlsx) dataset...")
+    mini_df = process_mini_ddsm(mini_ddsm_excel, mini_ddsm_base_dir, mini_mask_dir, mini_img_dir, preproc_args,
+                                contour_columns=["Tumour_Contour", "Tumour_Contour2"])
 
-    # Merge datasets
-    merged = pd.concat([cbis_df, mini_df], ignore_index=True)
+    mini2_df = pd.DataFrame([])
+    if mini2_excel and mini2_base_dir:
+        mini2_img_dir = os.path.join(outdir, "MINI2_IMAGES")
+        mini2_mask_dir = os.path.join(outdir, "MINI2_MASKS")
+        ensure_dir(mini2_img_dir)
+        ensure_dir(mini2_mask_dir)
+        print("[INFO] Processing Mini-DDSM Data-MoreThanTwoMasks (supports 3+ masks)...")
+        # Pass in third contour column as well
+        mini2_df = process_mini_ddsm(mini2_excel, mini2_base_dir, mini2_mask_dir, mini2_img_dir, preproc_args,
+                                     contour_columns=["Tumour_Contour", "Tumour_Contour2", "Tumour_Contour3"])
+        # Relabel dataset name to distinguish
+        if not mini2_df.empty:
+            mini2_df["dataset"] = "Mini-DDSM-MoreThanTwoMasks"
+
+    # Concatenate all datasets
+    dfs = [df for df in (cbis_df, mini_df, mini2_df) if df is not None and not df.empty]
+    if dfs:
+        merged = pd.concat(dfs, ignore_index=True)
+    else:
+        merged = pd.DataFrame([])
+
+    # Save CSV
+    ensure_dir(os.path.dirname(os.path.abspath(output_csv)) or ".")
     merged.to_csv(output_csv, index=False)
     
     print(f"\n[INFO] Unified dataset saved → {output_csv}")
     print(f"[INFO] Total samples: {len(merged)} "
-          f"(CBIS-DDSM={len(cbis_df)}, Mini-DDSM={len(mini_df)})")
+          f"(CBIS-DDSM={len(cbis_df)}, Mini-DDSM={len(mini_df)}, Mini-DDSM-MoreThanTwoMasks={len(mini2_df)})")
     print(f"\n[INFO] Preprocessing configuration:")
     print(f"  - Normalization: {'Sigmoid (non-linear)' if preproc_args['use_sigmoid'] else 'Linear'}")
     print(f"  - Median kernel: {preproc_args['median_kernel']}")
@@ -438,7 +579,7 @@ def process_datasets(cbis_csv, mini_ddsm_excel, mini_ddsm_base_dir, output_csv, 
 # ---------------- CLI ---------------- #
 def get_args():
     p = argparse.ArgumentParser(
-        description="Prepare CBIS-DDSM + Mini-DDSM unified dataset with comprehensive preprocessing",
+        description="Prepare CBIS-DDSM + Mini-DDSM unified dataset with comprehensive preprocessing (supports Data-MoreThanTwoMasks)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Preprocessing Pipeline:
@@ -459,6 +600,11 @@ Examples:
   python dataset_process.py --cbis-csv data.csv --mini-ddsm-excel DataWMask.xlsx \\
     --mini-ddsm-base-dir ./mini-ddsm --output-csv unified.csv
   
+  # Include Data-MoreThanTwoMasks dataset
+  python dataset_process.py --cbis-csv data.csv --mini-ddsm-excel DataWMask.xlsx \\
+    --mini-ddsm-base-dir ./mini-ddsm --mini2-excel Data-MoreThanTwoMasks.xlsx \\
+    --mini2-base-dir ./mini2-ddsm --output-csv unified.csv
+  
   # Use sigmoid normalization with custom parameters
   python dataset_process.py --cbis-csv data.csv --mini-ddsm-excel DataWMask.xlsx \\
     --mini-ddsm-base-dir ./mini-ddsm --output-csv unified.csv \\
@@ -471,7 +617,11 @@ Examples:
     p.add_argument("--mini-ddsm-excel", type=str, required=True,
                    help="Path to Mini-DDSM DataWMask.xlsx file")
     p.add_argument("--mini-ddsm-base-dir", type=str, required=True,
-                   help="Base directory containing Mini-DDSM images")
+                   help="Base directory containing Mini-DDSM images (MINI JPEGs)")
+    p.add_argument("--mini2-excel", type=str, required=False, default="",
+                   help="Path to Data-MoreThanTwoMasks.xlsx file (optional)")
+    p.add_argument("--mini2-base-dir", type=str, required=False, default="",
+                   help="Base directory for Data-MoreThanTwoMasks images/masks (optional)")
     p.add_argument("--output-csv", type=str, required=True,
                    help="Output path for unified CSV")
     p.add_argument("--outdir", type=str, default="DATASET",
@@ -510,11 +660,17 @@ if __name__ == "__main__":
         'clahe_delta': args.clahe_delta
     }
     
+    # Handle optional mini2 arguments
+    mini2_excel = args.mini2_excel if args.mini2_excel else None
+    mini2_base = args.mini2_base_dir if args.mini2_base_dir else None
+    
     # Process datasets
     process_datasets(
         args.cbis_csv,
         args.mini_ddsm_excel,
         args.mini_ddsm_base_dir,
+        mini2_excel,
+        mini2_base,
         args.output_csv,
         args.outdir,
         preproc_args
