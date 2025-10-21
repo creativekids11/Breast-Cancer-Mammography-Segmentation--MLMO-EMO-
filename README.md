@@ -1,10 +1,11 @@
+# Reviewing paper: https://pmc.ncbi.nlm.nih.gov/articles/PMC8786533/
 # MLMO-EMO: Multi-Level Multi-Objective Electromagnetism-like Optimization for Breast Cancer Segmentation
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.md)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 
-A novel deep learning approach for breast cancer segmentation in mammography images using **Multi-Level Multi-Objective Electromagnetism-like Optimization (MLMO-EMO)**. This method combines electromagnetic particle-based optimization with deep neural networks for accurate segmentation of breast lesions.
+Deep learning approach for breast cancer segmentation in mammography images using **Multi-Level Multi-Objective Electromagnetism-like Optimization (MLMO-EMO)**. This method combines electromagnetic particle-based optimization with deep neural networks for accurate segmentation of breast lesions.
 
 ![Preprocessing Pipeline](assets/preprocessing_pipeline.png)
 
