@@ -438,6 +438,16 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
     df = pd.read_excel(excel_path, sheet_name="Data") if excel_path.endswith((".xlsx", ".xls")) else pd.read_csv(excel_path)
     rows = []
     
+    if debug:
+        print(f"[DEBUG] Excel file {excel_path}: {len(df)} rows")
+        print(f"[DEBUG] Columns: {list(df.columns)}")
+        if 'fullPath' in df.columns:
+            sample_paths = df['fullPath'].dropna().head(3)
+            print(f"[DEBUG] Sample paths:")
+            for i, path in enumerate(sample_paths):
+                print(f"  {i+1}. {path}")
+        print(f"[DEBUG] Base directory: {base_dir}")
+    
     for idx, row in df.iterrows():
         img_rel_path = row.get("fullPath") or row.get("fileName")  # prefer fullPath then fileName
         if pd.isna(img_rel_path):
@@ -485,6 +495,19 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
             if os.path.exists(normalized_path):
                 img_path = normalized_path
                 break
+        
+        # If not found, try with different extensions for each potential path
+        if img_path is None:
+            image_extensions = ['.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp']
+            for potential_path in potential_paths:
+                base_path = os.path.splitext(potential_path)[0]
+                for ext in image_extensions:
+                    candidate_path = base_path + ext
+                    if os.path.exists(candidate_path):
+                        img_path = candidate_path
+                        break
+                if img_path:
+                    break
         
         if img_path is None:
             # Try to find the file by searching for the filename in subdirectories
@@ -614,6 +637,9 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
         }
         rows.append(row_data)
     
+    if debug:
+        print(f"[DEBUG] Processed {len(rows)} out of {len(df)} total rows from {excel_path}")
+    
     return pd.DataFrame(rows)
 
 # ---------------- Main Processing Function ---------------- #
@@ -657,6 +683,22 @@ def process_datasets(cbis_csv, mini_ddsm_excel, mini_ddsm_base_dir,
         ensure_dir(mini2_img_dir)
         ensure_dir(mini2_mask_dir)
         print("[INFO] Processing Mini-DDSM Data-MoreThanTwoMasks (supports 3+ masks)...")
+        print(f"[INFO] Excel file: {mini2_excel} (exists: {os.path.exists(mini2_excel)})")
+        print(f"[INFO] Base directory: {mini2_base_dir} (exists: {os.path.exists(mini2_base_dir)})")
+        
+        if debug and os.path.exists(mini2_base_dir):
+            print(f"[DEBUG] Contents of {mini2_base_dir}:")
+            try:
+                items = os.listdir(mini2_base_dir)[:10]  # First 10 items
+                for item in items:
+                    item_path = os.path.join(mini2_base_dir, item)
+                    if os.path.isdir(item_path):
+                        print(f"  [DIR]  {item}")
+                    else:
+                        print(f"  [FILE] {item}")
+            except Exception as e:
+                print(f"  Error listing directory: {e}")
+        
         # Pass in third contour column as well
         mini2_df = process_mini_ddsm(mini2_excel, mini2_base_dir, mini2_mask_dir, mini2_img_dir, preproc_args,
                                      contour_columns=["Tumour_Contour", "Tumour_Contour2", "Tumour_Contour3"], debug=debug)
