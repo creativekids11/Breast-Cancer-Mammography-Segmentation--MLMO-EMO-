@@ -434,6 +434,18 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
     ensure_dir(mask_outdir)
     ensure_dir(image_outdir)
     
+    # Normalize base directory path (remove trailing slashes)
+    base_dir = os.path.normpath(base_dir.rstrip('/\\'))
+    
+    if debug:
+        print(f"[DEBUG] Normalized base directory: '{base_dir}' (exists: {os.path.exists(base_dir)})")
+        if os.path.exists(base_dir):
+            try:
+                items = os.listdir(base_dir)
+                print(f"[DEBUG] Base dir contents: {items[:5]}{'...' if len(items) > 5 else ''}")
+            except Exception as e:
+                print(f"[DEBUG] Error listing base dir: {e}")
+    
     # Read the Data sheet from Excel
     df = pd.read_excel(excel_path, sheet_name="Data") if excel_path.endswith((".xlsx", ".xls")) else pd.read_csv(excel_path)
     rows = []
@@ -517,11 +529,26 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
             # Common image extensions to try
             image_extensions = ['.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp']
             
+            if debug:
+                print(f"  Searching for filename: '{filename}' (base: '{base_name}')")
+                print(f"  Base dir after normalization: '{base_dir}'")
+            
             # Search in subdirectories of base_dir
+            search_count = 0
             for root, dirs, files in os.walk(base_dir):
+                search_count += 1
+                if debug and search_count <= 3:  # Show first few directories searched
+                    print(f"  Searching in: {root}")
+                    if files:
+                        image_files = [f for f in files if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                        if image_files:
+                            print(f"    Found images: {image_files[:3]}")  # Show first 3
+                
                 # First try exact filename match
                 if filename in files:
                     img_path = os.path.join(root, filename)
+                    if debug:
+                        print(f"  ✓ Found exact match: {img_path}")
                     break
                     
                 # Then try with different extensions
@@ -529,7 +556,21 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
                     candidate_file = base_name + ext
                     if candidate_file in files:
                         img_path = os.path.join(root, candidate_file)
+                        if debug:
+                            print(f"  ✓ Found with extension {ext}: {img_path}")
                         break
+                
+                # Try fuzzy matching for files with similar names (case insensitive, partial match)
+                if img_path is None:
+                    base_name_lower = base_name.lower()
+                    for file in files:
+                        file_lower = file.lower()
+                        if (file_lower.endswith(('.png', '.jpg', '.jpeg')) and 
+                            base_name_lower in file_lower):
+                            img_path = os.path.join(root, file)
+                            if debug:
+                                print(f"  ✓ Found fuzzy match: {img_path} (for {base_name})")
+                            break
                         
                 if img_path:
                     break
@@ -559,6 +600,16 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
                             print(f"  Image files in {expected_dir}: {actual_files}")
                         except Exception as e:
                             print(f"  Error listing {expected_dir}: {e}")
+                    else:
+                        print(f"  Expected directory does not exist: {expected_dir}")
+                        # Try to find what directories do exist
+                        parent_dir = os.path.dirname(expected_dir)
+                        if os.path.exists(parent_dir):
+                            try:
+                                subdirs = [d for d in os.listdir(parent_dir) if os.path.isdir(os.path.join(parent_dir, d))]
+                                print(f"  Available subdirs in {parent_dir}: {subdirs[:5]}")
+                            except:
+                                pass
             else:
                 print(f"[WARNING] MINI: Image not found: {img_rel_path}")
             continue
