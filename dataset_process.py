@@ -365,17 +365,29 @@ def process_cbis(input_csv, mask_outdir, image_outdir, preproc_args: dict, debug
     grouped = df.groupby(["patient_id", "image_file_path"], dropna=False)
     processed_count = 0
     
+    # Define a prefix to strip (hardcoded absolute path root)
+    ABS_PREFIX = "D:/Hackathon2.0/BreastCancerAI/"
+
     for (pid, img_path), group in grouped:
         if debug and processed_count < 5:  # Show debug info for first 5 images
             print(f"[DEBUG] Processing CBIS image {processed_count + 1}: {pid} - {os.path.basename(img_path)}")
-        
+
         base_row = group.iloc[0].to_dict()
         abnormality_ids = group["abnormality_id"].astype(str).unique().tolist()
         mask_paths = [mp for mp in group["roi_mask_file_path"].dropna().unique().tolist() if isinstance(mp, str)]
-        
+
+        # --- Hardcode: convert absolute to relative path for image and mask files ---
+        def to_rel(path):
+            if isinstance(path, str) and path.startswith(ABS_PREFIX):
+                return path[len(ABS_PREFIX):]
+            return path
+
+        img_path_rel = to_rel(img_path)
+        mask_paths_rel = [to_rel(mp) for mp in mask_paths]
+
         # Merge masks if multiple
         merged_mask = None
-        for mp in mask_paths:
+        for mp in mask_paths_rel:
             if not os.path.exists(mp):
                 continue
             mask = cv2.imread(mp, cv2.IMREAD_GRAYSCALE)
@@ -383,13 +395,13 @@ def process_cbis(input_csv, mask_outdir, image_outdir, preproc_args: dict, debug
                 continue
             mask = (mask > 0).astype(np.uint8) * 255
             merged_mask = mask if merged_mask is None else cv2.bitwise_or(merged_mask, mask)
-        
+
         # Load and preprocess image
-        if os.path.exists(img_path):
-            full_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        if os.path.exists(img_path_rel):
+            full_img = cv2.imread(img_path_rel, cv2.IMREAD_GRAYSCALE)
             if full_img is None:
                 if debug:
-                    print(f"[DEBUG] CBIS: Failed to load image: {img_path}")
+                    print(f"[DEBUG] CBIS: Failed to load image: {img_path_rel}")
                 continue
             # Apply comprehensive preprocessing pipeline
             processed_img = preprocess_image(
@@ -401,35 +413,35 @@ def process_cbis(input_csv, mask_outdir, image_outdir, preproc_args: dict, debug
             )
         else:
             if debug:
-                print(f"[DEBUG] CBIS: Image file not found: {img_path}")
+                print(f"[DEBUG] CBIS: Image file not found: {img_path_rel}")
             continue
-        
+
         if merged_mask is None:
             merged_mask = np.zeros_like(processed_img, dtype=np.uint8)
-        
+
         # Ensure shapes match
         if merged_mask.shape != processed_img.shape:
             merged_mask = cv2.resize(merged_mask, (processed_img.shape[1], processed_img.shape[0]), 
                                     interpolation=cv2.INTER_NEAREST)
-        
+
         # Save with unique name
-        basename = os.path.splitext(os.path.basename(img_path))[0]
+        basename = os.path.splitext(os.path.basename(img_path_rel))[0]
         abn_str = "-".join(abnormality_ids) if abnormality_ids else "NA"
         unique_name = f"CBIS_{pid}_{basename}_{abn_str}"
-        
+
         proc_img_path = os.path.join(image_outdir, f"{unique_name}.png")
         mask_path = os.path.join(mask_outdir, f"{unique_name}_mask.png")
-        
+
         cv2.imwrite(proc_img_path, processed_img)
         cv2.imwrite(mask_path, merged_mask)
-        
+
         # Update row data for output
         base_row["dataset"] = "CBIS-DDSM"
         base_row["image_file_path"] = proc_img_path
         base_row["roi_mask_file_path"] = mask_path
         rows.append(base_row)
         processed_count += 1
-        
+
         if debug and processed_count <= 5:
             print(f"[DEBUG] CBIS: Successfully processed {unique_name}")
     
