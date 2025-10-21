@@ -571,7 +571,7 @@ def process_datasets(cbis_csv, mini_ddsm_excel, mini_ddsm_base_dir,
     print(f"[INFO] Total samples: {len(merged)} "
           f"(CBIS-DDSM={len(cbis_df)}, Mini-DDSM={len(mini_df)}, Mini-DDSM-MoreThanTwoMasks={len(mini2_df)})")
     print(f"\n[INFO] Preprocessing configuration:")
-    print(f"  - Normalization: {'Sigmoid (non-linear)' if preproc_args['avoid_sigmoid'] else 'Linear'}")
+    print(f"  - Normalization: {'Sigmoid (non-linear)' if preproc_args['use_sigmoid'] else 'Linear'}")
     print(f"  - Median kernel: {preproc_args['median_kernel']}")
     print(f"  - CLAHE tile size: {preproc_args['clahe_tile_size']}")
     print(f"  - CLAHE delta (δ): {preproc_args['clahe_delta']}")
