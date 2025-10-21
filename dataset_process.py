@@ -533,16 +533,28 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
                 print(f"  Searching for filename: '{filename}' (base: '{base_name}')")
                 print(f"  Base dir after normalization: '{base_dir}'")
             
+            # Extract expected path components for better matching
+            expected_category = None  # Benign, Cancer, Normal
+            if img_rel_path_cleaned.startswith(('Benign', 'Cancer', 'Normal')):
+                expected_category = img_rel_path_cleaned.split(os.sep)[0]
+                if debug:
+                    print(f"  Expected category: {expected_category}")
+            
             # Search in subdirectories of base_dir
             search_count = 0
             for root, dirs, files in os.walk(base_dir):
                 search_count += 1
-                if debug and search_count <= 3:  # Show first few directories searched
+                
+                # Skip directories that don't match expected category if we have one
+                if expected_category and expected_category.lower() not in root.lower():
+                    continue
+                    
+                if debug and search_count <= 5:  # Show first few directories searched
                     print(f"  Searching in: {root}")
                     if files:
-                        image_files = [f for f in files if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                        image_files = [f for f in files if f.lower().endswith(('.png', '.jpg', '.jpeg')) and 'mask' not in f.lower()]
                         if image_files:
-                            print(f"    Found images: {image_files[:3]}")  # Show first 3
+                            print(f"    Found non-mask images: {image_files[:3]}")  # Show first 3
                 
                 # First try exact filename match
                 if filename in files:
@@ -563,14 +575,35 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
                 # Try fuzzy matching for files with similar names (case insensitive, partial match)
                 if img_path is None:
                     base_name_lower = base_name.lower()
-                    for file in files:
-                        file_lower = file.lower()
-                        if (file_lower.endswith(('.png', '.jpg', '.jpeg')) and 
-                            base_name_lower in file_lower):
-                            img_path = os.path.join(root, file)
-                            if debug:
-                                print(f"  ✓ Found fuzzy match: {img_path} (for {base_name})")
-                            break
+                    # Extract key components from the expected filename
+                    # For A_1865_1.RIGHT_MLO.png -> look for files with RIGHT_MLO pattern
+                    parts = base_name_lower.split('_')
+                    if len(parts) >= 3:
+                        # Extract view pattern (like RIGHT_MLO, LEFT_CC)
+                        view_pattern = '_'.join(parts[-2:])  # e.g., "right_mlo"
+                        
+                        for file in files:
+                            file_lower = file.lower()
+                            # Skip mask files for now, look for original images
+                            if (file_lower.endswith(('.png', '.jpg', '.jpeg')) and 
+                                'mask' not in file_lower and
+                                view_pattern in file_lower):
+                                img_path = os.path.join(root, file)
+                                if debug:
+                                    print(f"  ✓ Found fuzzy match by view pattern: {img_path} (pattern: {view_pattern})")
+                                break
+                    
+                    # If still not found, try broader fuzzy matching
+                    if img_path is None:
+                        for file in files:
+                            file_lower = file.lower()
+                            if (file_lower.endswith(('.png', '.jpg', '.jpeg')) and 
+                                'mask' not in file_lower and
+                                base_name_lower in file_lower):
+                                img_path = os.path.join(root, file)
+                                if debug:
+                                    print(f"  ✓ Found fuzzy match: {img_path} (for {base_name})")
+                                break
                         
                 if img_path:
                     break
@@ -578,6 +611,13 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
                 # Limit search depth to avoid performance issues
                 if root.count(os.sep) - base_dir.count(os.sep) >= 3:
                     dirs.clear()  # Don't go deeper
+            
+            # Final fallback: if we have an expected category but found no files,
+            # warn user about the mismatch and suggest checking data structure
+            if img_path is None and expected_category and debug:
+                print(f"  [WARNING] No files found matching pattern in {expected_category} category.")
+                print(f"  This suggests the Excel file references don't match the actual directory structure.")
+                print(f"  Consider verifying that the Excel file and image directory are correctly paired.")
         
         if img_path is None or not os.path.exists(img_path):
             if debug:
@@ -830,8 +870,8 @@ Examples:
     
     # Preprocessing arguments
     preproc = p.add_argument_group('preprocessing options')
-    preproc.add_argument("--avoid-sigmoid", action="store_false",
-                        help="Avoid sigmoid (non-linear) normalization instead of linear")
+    preproc.add_argument("--use-sigmoid", action="store_true",
+                        help="Use sigmoid (non-linear) normalization instead of linear")
     preproc.add_argument("--median-kernel", type=int, default=5,
                         help="Kernel size for median filtering (must be odd, default: 5)")
     preproc.add_argument("--clahe-tile-size", type=int, nargs=2, default=[8, 8],
@@ -859,7 +899,7 @@ if __name__ == "__main__":
     
     # Prepare preprocessing arguments dictionary
     preproc_args = {
-        'use_sigmoid': args.avoid_sigmoid,
+        'use_sigmoid': args.use_sigmoid,
         'median_kernel': args.median_kernel,
         'clahe_tile_size': args.clahe_tile_size,
         'clahe_delta': args.clahe_delta
