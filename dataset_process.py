@@ -80,27 +80,45 @@ def _resolve_mask_path(candidate: str, base_dir: str) -> Optional[str]:
     if os.path.isabs(cand) and os.path.exists(cand):
         return cand
 
-    # Try as relative to base_dir (preserve internal backslashes)
-    joined = os.path.join(base_dir, cand)
-    norm = os.path.normpath(joined)
-    if os.path.exists(norm):
-        return norm
-
-    # Try replace backslashes with os.sep pieces
-    cand2 = cand.replace("\\", os.sep).replace("/", os.sep)
-    joined2 = os.path.join(base_dir, cand2)
-    norm2 = os.path.normpath(joined2)
-    if os.path.exists(norm2):
-        return norm2
-
-    # Try only the filename inside base_dir subtree (slow for large bases; we avoid scanning entire tree)
-    # but attempt a sibling check: if candidate looks like "subdir/file.png", try last two components
-    parts = cand.replace("\\", "/").split("/")
-    if len(parts) >= 2:
-        tail = os.path.join(*parts[-2:])
-        cand3 = os.path.join(base_dir, tail)
-        if os.path.exists(cand3):
-            return os.path.normpath(cand3)
+    # Normalize path separators
+    cand_normalized = cand.replace("\\", os.sep).replace("/", os.sep)
+    
+    # Try multiple resolution strategies
+    potential_paths = [
+        # Strategy 1: Direct join with base_dir
+        os.path.join(base_dir, cand),
+        # Strategy 2: Normalized path separators
+        os.path.join(base_dir, cand_normalized),
+    ]
+    
+    # Strategy 3: Try without leading path component if it exists
+    if os.sep in cand_normalized:
+        parts = cand_normalized.split(os.sep)
+        if len(parts) > 1:
+            # Skip first component and try rest
+            remaining_path = os.sep.join(parts[1:])
+            potential_paths.append(os.path.join(base_dir, remaining_path))
+        
+        # Strategy 4: Try last two components only
+        if len(parts) >= 2:
+            tail = os.path.join(*parts[-2:])
+            potential_paths.append(os.path.join(base_dir, tail))
+    
+    # Check all potential paths
+    for potential_path in potential_paths:
+        norm_path = os.path.normpath(potential_path)
+        if os.path.exists(norm_path):
+            return norm_path
+    
+    # Strategy 5: Search for filename in subdirectories (limited depth)
+    filename = os.path.basename(cand_normalized)
+    if filename:
+        for root, dirs, files in os.walk(base_dir):
+            if filename in files:
+                return os.path.join(root, filename)
+            # Limit search depth to avoid performance issues
+            if root.count(os.sep) - base_dir.count(os.sep) >= 3:
+                dirs.clear()  # Don't go deeper
 
     # Not found
     return None
@@ -396,7 +414,7 @@ def process_cbis(input_csv, mask_outdir, image_outdir, preproc_args: dict):
 
 # ---------------- Mini-DDSM processing ---------------- #
 def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_args: dict,
-                      contour_columns: Optional[List[str]] = None):
+                      contour_columns: Optional[List[str]] = None, debug: bool = False):
     """
     Process Mini-DDSM dataset with comprehensive preprocessing.
     Supports multiple mask columns (Tumour_Contour, Tumour_Contour2, Tumour_Contour3, etc.)
@@ -425,11 +443,101 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
         if pd.isna(img_rel_path):
             continue
         img_rel_path = str(img_rel_path).strip()
-        img_path = os.path.join(base_dir, img_rel_path) if not os.path.isabs(img_rel_path) else img_rel_path
-        img_path = os.path.normpath(img_path)
         
-        if not os.path.exists(img_path):
-            print(f"[WARNING] MINI: Image not found: {img_path}")
+        # Handle mixed path separators and normalize
+        img_rel_path_normalized = img_rel_path.replace("\\", os.sep).replace("/", os.sep)
+        
+        # Clean up path - remove base directory name if it appears at the start
+        base_dir_name = os.path.basename(os.path.normpath(base_dir))
+        img_rel_path_cleaned = img_rel_path_normalized
+        
+        # Try multiple ways to clean the path
+        for sep in [os.sep, '/', '\\']:
+            prefix = base_dir_name + sep
+            if img_rel_path_normalized.startswith(prefix):
+                img_rel_path_cleaned = img_rel_path_normalized[len(prefix):]
+                break
+        
+        # Try multiple path resolution strategies
+        img_path = None
+        potential_paths = []
+        
+        if os.path.isabs(img_rel_path):
+            potential_paths.append(img_rel_path)
+        else:
+            # Strategy 1: Direct join with base_dir (original path)
+            potential_paths.append(os.path.join(base_dir, img_rel_path))
+            # Strategy 2: Normalized path separators
+            potential_paths.append(os.path.join(base_dir, img_rel_path_normalized))
+            # Strategy 3: Cleaned path (without duplicate base dir name)
+            potential_paths.append(os.path.join(base_dir, img_rel_path_cleaned))
+            # Strategy 4: Try without leading path component if it exists
+            if os.sep in img_rel_path_cleaned:
+                path_parts = img_rel_path_cleaned.split(os.sep)
+                if len(path_parts) > 1:
+                    # Skip first component and try rest
+                    remaining_path = os.sep.join(path_parts[1:])
+                    potential_paths.append(os.path.join(base_dir, remaining_path))
+        
+        # Find the first existing path
+        for potential_path in potential_paths:
+            normalized_path = os.path.normpath(potential_path)
+            if os.path.exists(normalized_path):
+                img_path = normalized_path
+                break
+        
+        if img_path is None:
+            # Try to find the file by searching for the filename in subdirectories
+            filename = os.path.basename(img_rel_path_cleaned)
+            base_name = os.path.splitext(filename)[0]
+            
+            # Common image extensions to try
+            image_extensions = ['.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp']
+            
+            # Search in subdirectories of base_dir
+            for root, dirs, files in os.walk(base_dir):
+                # First try exact filename match
+                if filename in files:
+                    img_path = os.path.join(root, filename)
+                    break
+                    
+                # Then try with different extensions
+                for ext in image_extensions:
+                    candidate_file = base_name + ext
+                    if candidate_file in files:
+                        img_path = os.path.join(root, candidate_file)
+                        break
+                        
+                if img_path:
+                    break
+                    
+                # Limit search depth to avoid performance issues
+                if root.count(os.sep) - base_dir.count(os.sep) >= 3:
+                    dirs.clear()  # Don't go deeper
+        
+        if img_path is None or not os.path.exists(img_path):
+            if debug:
+                print(f"\n[DEBUG] MINI: Image not found. Original path: '{img_rel_path}'")
+                print(f"  Normalized: '{img_rel_path_normalized}'")
+                print(f"  Cleaned: '{img_rel_path_cleaned}'")
+                print(f"  Base dir: '{base_dir}'")
+                print("  Tried paths:")
+                for i, p in enumerate(potential_paths, 1):
+                    norm_p = os.path.normpath(p)
+                    exists = os.path.exists(norm_p)
+                    print(f"    {i}. {norm_p} -> {'EXISTS' if exists else 'NOT FOUND'}")
+                
+                # Show what files actually exist in the expected directory
+                if potential_paths:
+                    expected_dir = os.path.dirname(potential_paths[-1])  # Use last attempt
+                    if os.path.exists(expected_dir):
+                        try:
+                            actual_files = [f for f in os.listdir(expected_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))][:5]
+                            print(f"  Image files in {expected_dir}: {actual_files}")
+                        except Exception as e:
+                            print(f"  Error listing {expected_dir}: {e}")
+            else:
+                print(f"[WARNING] MINI: Image not found: {img_rel_path}")
             continue
         
         # Load and preprocess image
@@ -510,7 +618,7 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
 
 # ---------------- Main Processing Function ---------------- #
 def process_datasets(cbis_csv, mini_ddsm_excel, mini_ddsm_base_dir, 
-                     mini2_excel, mini2_base_dir, output_csv, outdir, preproc_args: dict):
+                     mini2_excel, mini2_base_dir, output_csv, outdir, preproc_args: dict, debug: bool = False):
     """
     Process CBIS-DDSM, Mini-DDSM, and optionally Data-MoreThanTwoMasks (mini2) datasets 
     with comprehensive preprocessing.
@@ -540,7 +648,7 @@ def process_datasets(cbis_csv, mini_ddsm_excel, mini_ddsm_base_dir,
     
     print("[INFO] Processing Mini-DDSM (DataWMask.xlsx) dataset...")
     mini_df = process_mini_ddsm(mini_ddsm_excel, mini_ddsm_base_dir, mini_mask_dir, mini_img_dir, preproc_args,
-                                contour_columns=["Tumour_Contour", "Tumour_Contour2"])
+                                contour_columns=["Tumour_Contour", "Tumour_Contour2"], debug=debug)
 
     mini2_df = pd.DataFrame([])
     if mini2_excel and mini2_base_dir:
@@ -551,7 +659,7 @@ def process_datasets(cbis_csv, mini_ddsm_excel, mini_ddsm_base_dir,
         print("[INFO] Processing Mini-DDSM Data-MoreThanTwoMasks (supports 3+ masks)...")
         # Pass in third contour column as well
         mini2_df = process_mini_ddsm(mini2_excel, mini2_base_dir, mini2_mask_dir, mini2_img_dir, preproc_args,
-                                     contour_columns=["Tumour_Contour", "Tumour_Contour2", "Tumour_Contour3"])
+                                     contour_columns=["Tumour_Contour", "Tumour_Contour2", "Tumour_Contour3"], debug=debug)
         # Relabel dataset name to distinguish
         if not mini2_df.empty:
             mini2_df["dataset"] = "Mini-DDSM-MoreThanTwoMasks"
@@ -639,6 +747,10 @@ Examples:
     preproc.add_argument("--clahe-delta", type=float, default=0.01,
                         help="CLAHE contrast factor δ, where 0 < δ ≤ 1 (default: 0.01)")
     
+    # Debug option
+    p.add_argument("--debug", action="store_true",
+                   help="Show debug information about file paths and resolution")
+    
     return p.parse_args()
 
 if __name__ == "__main__":
@@ -673,5 +785,7 @@ if __name__ == "__main__":
         mini2_base,
         args.output_csv,
         args.outdir,
-        preproc_args
+        preproc_args,
+        debug=args.debug
     )
+    
