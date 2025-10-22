@@ -72,18 +72,8 @@ def get_training_augmentation(img_size=512):
     return A.Compose([
         A.Resize(img_size, img_size),
         A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.3),
-        A.RandomBrightnessContrast(
-            brightness_limit=0.2,
-            contrast_limit=0.2,
-            p=0.5
-        ),
-        A.GaussNoise(var_limit=10.0, p=0.3),
-        A.GaussianBlur(blur_limit=(3, 5), p=0.3),
-        A.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        ),
+        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ])
 
@@ -96,6 +86,15 @@ def get_validation_augmentation(img_size=512):
             mean=[0.485, 0.456, 0.406],
             std=[0.229, 0.224, 0.225]
         ),
+        ToTensorV2()
+    ])
+
+
+def get_fast_training_augmentation(img_size=256):
+    """A lightweight augmentation pipeline for fast experiments."""
+    return A.Compose([
+        A.Resize(img_size, img_size),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ])
 
@@ -454,7 +453,7 @@ def main():
                        help='Use CSV file instead of directory structure')
     
     # Model arguments
-    parser.add_argument('--encoder', type=str, default='resnet18',
+    parser.add_argument('--encoder', type=str, default='resnet34',
                        choices=['resnet18', 'resnet34', 'resnet50', 'resnet101', 
                                'efficientnet-b0', 'efficientnet-b4'],
                        help='Encoder backbone')
@@ -462,6 +461,9 @@ def main():
                        help='Number of electromagnetic particles')
     parser.add_argument('--emo-iterations', type=int, default=2,
                        help='Number of EMO refinement iterations')
+    parser.add_argument('--hidden-dim', type=int, default=64,
+            help='Hidden dimension for particles / fusion')
+    parser.add_argument('--fast', action='store_true', help='Enable fast training mode (smaller model, lighter augmentation)')
     
     # Training arguments
     parser.add_argument('--epochs', type=int, default=120,
@@ -521,10 +523,27 @@ def main():
             args.data_dir
         )
     
+    # Fast mode adjustments
+    if args.fast:
+        print("[INFO] Fast training mode enabled: reducing image size, lighter augmentations, enabling AMP if CUDA available")
+        # reduce epochs for quick runs
+        if args.epochs > 10:
+            args.epochs = 10
+        # reduce image size for speed
+        if args.img_size > 256:
+            args.img_size = 256
+        # enable amp
+        if torch.cuda.is_available():
+            args.use_amp = True
+        # prefer smaller encoder if user chose a large one
+        if args.encoder in ('resnet50', 'resnet101', 'efficientnet-b4'):
+            print(f"[INFO] Replacing encoder {args.encoder} with resnet18 for fast mode")
+            args.encoder = 'resnet18'
+
     # Create datasets
     train_dataset = MammographyDataset(
         train_imgs, train_masks,
-        transform=get_training_augmentation(args.img_size),
+        transform=(get_fast_training_augmentation(args.img_size) if args.fast else get_training_augmentation(args.img_size)),
         img_size=args.img_size
     )
     
@@ -539,16 +558,16 @@ def main():
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True
+        num_workers= max(0, args.num_workers if not args.fast else min(4, args.num_workers)),
+        pin_memory= not args.fast
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True
+        num_workers= max(0, args.num_workers if not args.fast else min(2, args.num_workers)),
+        pin_memory= not args.fast
     )
     
     print(f"Training samples: {len(train_dataset)}")
@@ -564,7 +583,8 @@ def main():
         encoder_weights='imagenet',
         num_classes=1,
         num_particles=args.num_particles,
-        emo_iterations=args.emo_iterations
+        emo_iterations=args.emo_iterations,
+        hidden_dim=args.hidden_dim
     )
     model = model.to(device)
     
