@@ -448,17 +448,17 @@ def main():
                        help='Number of EMO refinement iterations')
     
     # Training arguments
-    parser.add_argument('--epochs', type=int, default=150,
+    parser.add_argument('--epochs', type=int, default=120,
                        help='Number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=1,
+    parser.add_argument('--batch-size', type=int, default=16,
                        help='Batch size for training')
     parser.add_argument('--lr', type=float, default=3e-4,
                        help='Learning rate')
     parser.add_argument('--img-size', type=int, default=256,
                        help='Input image size')
-    parser.add_argument('--num-workers', type=int, default=2,
+    parser.add_argument('--num-workers', type=int, default=15,
                        help='Number of data loading workers')
-    parser.add_argument('--gradient-accumulation-steps', type=int, default=4,
+    parser.add_argument('--gradient-accumulation-steps', type=int, default=2,
                        help='Number of gradient accumulation steps')
     
     # Loss weights
