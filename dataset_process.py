@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# hi
 """
 Unified dataset prep for CBIS-DDSM, Mini-DDSM, and Mini-DDSM Data-MoreThanTwoMasks.
 
@@ -38,6 +39,182 @@ from typing import Tuple, List, Optional
 def ensure_dir(dir_path: str):
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
+
+
+def load_image_adaptive(base_path: str, debug: bool = False) -> tuple:
+    """
+    Adaptively load image with support for multiple extensions (.jpg, .png, .jpeg, etc.)
+    
+    Args:
+        base_path: Base path to image (with or without extension)
+        debug: Whether to print debug information
+    
+    Returns:
+        Tuple of (image_array, actual_path) or (None, None) if not found
+    """
+    import cv2
+    
+    # Common image extensions to try
+    extensions = ['.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp']
+    
+    # First try the path as-is (might already have extension)
+    if os.path.exists(base_path):
+        img = cv2.imread(base_path, cv2.IMREAD_GRAYSCALE)
+        if img is not None:
+            if debug:
+                print(f"[DEBUG] Loaded image directly: {base_path}")
+            return img, base_path
+    
+    # Remove extension from base_path if present
+    base_path_no_ext = os.path.splitext(base_path)[0]
+    
+    # Try each extension
+    for ext in extensions:
+        candidate_path = base_path_no_ext + ext
+        if os.path.exists(candidate_path):
+            img = cv2.imread(candidate_path, cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                if debug:
+                    print(f"[DEBUG] Loaded image with {ext} extension: {candidate_path}")
+                return img, candidate_path
+    
+    # If still not found, try case-insensitive search in the same directory
+    if os.path.dirname(base_path_no_ext):
+        dir_path = os.path.dirname(base_path_no_ext)
+        filename_base = os.path.basename(base_path_no_ext).lower()
+        
+        if os.path.exists(dir_path):
+            for file in os.listdir(dir_path):
+                file_base_lower = os.path.splitext(file)[0].lower()
+                file_ext_lower = os.path.splitext(file)[1].lower()
+                
+                if (file_base_lower == filename_base and 
+                    file_ext_lower in [ext.lower() for ext in extensions]):
+                    candidate_path = os.path.join(dir_path, file)
+                    img = cv2.imread(candidate_path, cv2.IMREAD_GRAYSCALE)
+                    if img is not None:
+                        if debug:
+                            print(f"[DEBUG] Loaded image with case-insensitive match: {candidate_path}")
+                        return img, candidate_path
+    
+    if debug:
+        print(f"[DEBUG] Could not load image for base path: {base_path}")
+        print(f"[DEBUG] Tried extensions: {extensions}")
+    
+    return None, None
+
+
+def get_image_column_name(df_columns: list, debug: bool = False) -> str:
+    """
+    Adaptively determine the column name for image paths in the dataframe.
+    
+    Args:
+        df_columns: List of column names from the dataframe
+        debug: Whether to print debug information
+    
+    Returns:
+        The best matching column name for image paths
+    """
+    # Priority order for image path column names
+    image_column_candidates = [
+        'fullPath',           # Most specific
+        'fileName',           # Common alternative
+        'image_path',         # Standard naming
+        'imagePath',          # CamelCase variant
+        'file_path',          # Generic path
+        'filePath',           # CamelCase variant
+        'path',               # Most generic
+        'image',              # Simple naming
+        'file'                # Very generic
+    ]
+    
+    # Convert to lowercase for case-insensitive matching
+    df_columns_lower = [col.lower() for col in df_columns]
+    
+    for candidate in image_column_candidates:
+        # Exact match (case-sensitive)
+        if candidate in df_columns:
+            if debug:
+                print(f"[DEBUG] Found exact image column match: {candidate}")
+            return candidate
+        
+        # Case-insensitive match
+        candidate_lower = candidate.lower()
+        if candidate_lower in df_columns_lower:
+            actual_column = df_columns[df_columns_lower.index(candidate_lower)]
+            if debug:
+                print(f"[DEBUG] Found case-insensitive image column match: {actual_column}")
+            return actual_column
+    
+    # Fallback: look for any column containing 'path' or 'file'
+    for col in df_columns:
+        col_lower = col.lower()
+        if 'path' in col_lower or 'file' in col_lower:
+            if debug:
+                print(f"[DEBUG] Found fallback image column match: {col}")
+            return col
+    
+    # Last resort: return first column (with warning)
+    if df_columns:
+        if debug:
+            print(f"[WARNING] No suitable image column found. Using first column: {df_columns[0]}")
+            print(f"[WARNING] Available columns: {df_columns}")
+        return df_columns[0]
+    
+    raise ValueError("No columns found in dataframe")
+
+
+def get_mask_column_names(df_columns: list, debug: bool = False) -> list:
+    """
+    Adaptively determine the column names for mask paths in the dataframe.
+    
+    Args:
+        df_columns: List of column names from the dataframe
+        debug: Whether to print debug information
+    
+    Returns:
+        List of column names that likely contain mask paths
+    """
+    mask_column_candidates = [
+        'Tumour_Contour',
+        'Tumour_Contour2', 
+        'Tumour_Contour3',
+        'TumourContour',
+        'TumourContour2',
+        'TumourContour3',
+        'mask_path',
+        'maskPath',
+        'contour',
+        'roi_mask_file_path',
+        'mask'
+    ]
+    
+    found_columns = []
+    df_columns_lower = [col.lower() for col in df_columns]
+    
+    for candidate in mask_column_candidates:
+        # Exact match (case-sensitive)
+        if candidate in df_columns:
+            found_columns.append(candidate)
+            continue
+        
+        # Case-insensitive match
+        candidate_lower = candidate.lower()
+        if candidate_lower in df_columns_lower:
+            actual_column = df_columns[df_columns_lower.index(candidate_lower)]
+            found_columns.append(actual_column)
+    
+    # Also look for any column containing 'contour', 'mask', or 'roi'
+    for col in df_columns:
+        col_lower = col.lower()
+        if (('contour' in col_lower or 'mask' in col_lower or 'roi' in col_lower) and 
+            col not in found_columns):
+            found_columns.append(col)
+    
+    if debug:
+        print(f"[DEBUG] Found mask columns: {found_columns}")
+    
+    return found_columns
 
 def _normalize_mask_ref(mask_ref: str) -> Optional[str]:
     """Return None for empty/placeholder tokens, else normalized path string."""
@@ -123,23 +300,30 @@ def _resolve_mask_path(candidate: str, base_dir: str) -> Optional[str]:
     # Not found
     return None
 
-def _merge_mask_files(mask_paths: List[str], target_shape: tuple) -> np.ndarray:
+def _merge_mask_files(mask_paths: List[str], target_shape: tuple, debug: bool = False) -> np.ndarray:
     """Read and OR all existing masks in mask_paths; return binary (0/255) mask shaped target_shape."""
     h, w = target_shape
     out_mask = np.zeros((h, w), dtype=np.uint8)
     for mp in mask_paths:
         if not mp:
             continue
-        if not os.path.exists(mp):
-            continue
-        m = cv2.imread(mp, cv2.IMREAD_GRAYSCALE)
+        
+        # Use adaptive loading for masks
+        m, actual_path = load_image_adaptive(mp, debug=debug)
         if m is None:
+            if debug:
+                print(f"[DEBUG] Could not load mask with any extension: {mp}")
             continue
+        
         # Binarize then resize if needed
         m_bin = (m > 0).astype(np.uint8) * 255
         if m_bin.shape != (h, w):
             m_bin = cv2.resize(m_bin, (w, h), interpolation=cv2.INTER_NEAREST)
         out_mask = cv2.bitwise_or(out_mask, m_bin)
+        
+        if debug:
+            print(f"[DEBUG] Successfully loaded and merged mask: {actual_path}")
+    
     return out_mask
 
 # ---------------- Image Denoising & Enhancement Techniques ---------------- #
@@ -385,36 +569,32 @@ def process_cbis(input_csv, mask_outdir, image_outdir, preproc_args: dict, debug
         img_path_rel = to_rel(img_path)
         mask_paths_rel = [to_rel(mp) for mp in mask_paths]
 
-        # Merge masks if multiple
+        # Merge masks if multiple using adaptive loading
         merged_mask = None
         for mp in mask_paths_rel:
-            if not os.path.exists(mp):
-                continue
-            mask = cv2.imread(mp, cv2.IMREAD_GRAYSCALE)
+            mask, actual_mask_path = load_image_adaptive(mp, debug=debug)
             if mask is None:
+                if debug:
+                    print(f"[DEBUG] CBIS: Could not load mask: {mp}")
                 continue
             mask = (mask > 0).astype(np.uint8) * 255
             merged_mask = mask if merged_mask is None else cv2.bitwise_or(merged_mask, mask)
 
-        # Load and preprocess image
-        if os.path.exists(img_path_rel):
-            full_img = cv2.imread(img_path_rel, cv2.IMREAD_GRAYSCALE)
-            if full_img is None:
-                if debug:
-                    print(f"[DEBUG] CBIS: Failed to load image: {img_path_rel}")
-                continue
-            # Apply comprehensive preprocessing pipeline
-            processed_img = preprocess_image(
-                full_img,
-                use_sigmoid=preproc_args['use_sigmoid'],
-                median_kernel=preproc_args['median_kernel'],
-                clahe_tile_size=tuple(preproc_args['clahe_tile_size']),
-                clahe_delta=preproc_args['clahe_delta']
-            )
-        else:
+        # Load and preprocess image using adaptive loading
+        full_img, actual_img_path = load_image_adaptive(img_path_rel, debug=debug)
+        if full_img is None:
             if debug:
-                print(f"[DEBUG] CBIS: Image file not found: {img_path_rel}")
+                print(f"[DEBUG] CBIS: Failed to load image with any extension: {img_path_rel}")
             continue
+        
+        # Apply comprehensive preprocessing pipeline
+        processed_img = preprocess_image(
+            full_img,
+            use_sigmoid=preproc_args['use_sigmoid'],
+            median_kernel=preproc_args['median_kernel'],
+            clahe_tile_size=tuple(preproc_args['clahe_tile_size']),
+            clahe_delta=preproc_args['clahe_delta']
+        )
 
         if merged_mask is None:
             merged_mask = np.zeros_like(processed_img, dtype=np.uint8)
@@ -464,10 +644,8 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
         image_outdir: Output directory for processed images
         preproc_args: Dictionary containing preprocessing parameters
         contour_columns: List of column names to look for masks (e.g. ["Tumour_Contour","Tumour_Contour2"])
-                        If None, defaults to ["Tumour_Contour","Tumour_Contour2"]
+                        If None, will be determined adaptively from the dataframe columns
     """
-    if contour_columns is None:
-        contour_columns = ["Tumour_Contour", "Tumour_Contour2"]
     
     ensure_dir(mask_outdir)
     ensure_dir(image_outdir)
@@ -486,6 +664,13 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
     
     # Read the Data sheet from Excel
     df = pd.read_excel(excel_path, sheet_name="Data") if excel_path.endswith((".xlsx", ".xls")) else pd.read_csv(excel_path)
+    
+    # Get adaptive contour columns if not specified
+    if contour_columns is None:
+        contour_columns = get_mask_column_names(df.columns.tolist(), debug=debug)
+        if debug:
+            print(f"[DEBUG] Using adaptive mask columns: {contour_columns}")
+    
     rows = []
     
     if debug:
@@ -498,9 +683,20 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
                 print(f"  {i+1}. {path}")
         print(f"[DEBUG] Base directory: {base_dir}")
     
+    # Get the appropriate column name for image paths
+    try:
+        image_column = get_image_column_name(df.columns.tolist(), debug=debug)
+        if debug:
+            print(f"[DEBUG] Using image column: {image_column}")
+    except ValueError as e:
+        print(f"[ERROR] Failed to determine image column: {e}")
+        return pd.DataFrame([])
+    
     for idx, row in df.iterrows():
-        img_rel_path = row.get("fullPath") or row.get("fileName")  # prefer fullPath then fileName
+        img_rel_path = row.get(image_column)
         if pd.isna(img_rel_path):
+            if debug:
+                print(f"[DEBUG] Skipping row {idx} - no image path in column '{image_column}'")
             continue
         img_rel_path = str(img_rel_path).strip()
         
@@ -756,11 +952,15 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
                 print(f"[WARNING] MINI: Image not found: {img_rel_path}")
             continue
         
-        # Load and preprocess image
-        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        # Load and preprocess image using adaptive loading
+        img, actual_img_path = load_image_adaptive(img_path, debug=debug)
         if img is None:
-            print(f"[WARNING] MINI: Failed to load image: {img_path}")
+            if debug:
+                print(f"[DEBUG] MINI: Failed to load image with any extension: {img_path}")
             continue
+        
+        if debug:
+            print(f"[DEBUG] MINI: Successfully loaded image: {actual_img_path}")
         
         # Apply comprehensive preprocessing pipeline
         processed_img = preprocess_image(
@@ -799,7 +999,7 @@ def process_mini_ddsm(excel_path, base_dir, mask_outdir, image_outdir, preproc_a
                     pass
         
         # Merge masks (if any) using the utility function
-        mask = _merge_mask_files(resolved_masks, (h, w))
+        mask = _merge_mask_files(resolved_masks, (h, w), debug=debug)
         
         # Create unique filename
         filename = row.get("fileName") or os.path.basename(img_path)
