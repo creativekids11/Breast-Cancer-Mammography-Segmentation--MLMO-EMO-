@@ -114,6 +114,10 @@ class PaperDatasetProcessor:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True)
         
+        # Initialize best model tracking
+        self.best_dice = -1
+        self.best_model = None
+        
         # Detect column names adaptively
         columns = self.df.columns.tolist()
         print(f"Available columns: {columns}")
@@ -221,7 +225,7 @@ class PaperDatasetProcessor:
                 mask
             )
             
-            return {
+            result = {
                 'image_path': image_path,
                 'mask_path': mask_path,
                 'segmentation_results': segmentation_results,
@@ -230,6 +234,20 @@ class PaperDatasetProcessor:
                 'success': True,
                 'error': None
             }
+            
+            # Track best model based on dice score
+            if result['success'] and result['metrics']:
+                dice = result['metrics']['dice_coefficient']
+                if dice > self.best_dice:
+                    self.best_dice = dice
+                    self.best_model = {
+                        'thresholds': result['segmentation_results']['thresholds'],
+                        'dice': dice,
+                        'image_path': result['image_path'],
+                        'method': method
+                    }
+            
+            return result
             
         except Exception as e:
             return {
@@ -375,6 +393,13 @@ class PaperDatasetProcessor:
                 metrics_df = pd.DataFrame(metrics_rows)
                 metrics_df.to_csv(csv_file, index=False)
                 print(f"Metrics CSV saved: {csv_file}")
+        
+        # Save best model if found
+        if self.best_model:
+            best_file = output_path / f"best_model_{method}_{timestamp}.pkl"
+            with open(best_file, 'wb') as f:
+                pickle.dump(self.best_model, f)
+            print(f"Best model saved: {best_file}")
         
         return json_file, pickle_file
     
