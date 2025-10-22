@@ -17,6 +17,9 @@ from typing import List, Dict, Tuple
 import json
 from datetime import datetime
 
+cv2.setUseOptimized(True)
+cv2.setNumThreads(4)  # Use 4 CPU threads
+
 # Import the exact paper implementation
 try:
     # Try relative import (when run as module)
@@ -234,7 +237,7 @@ class PaperDatasetProcessor:
             'method': method,
             'total_images': len(df_subset),
             'successful_processing': len(all_metrics),
-            'success_rate': len(all_metrics) / len(df_subset) if df_subset else 0,
+            'success_rate': len(all_metrics) / len(df_subset) if len(df_subset) > 0 else 0,
             'aggregate_metrics': aggregate_stats,
             'detailed_results': results if save_results else None,
             'processing_timestamp': datetime.now().isoformat()
