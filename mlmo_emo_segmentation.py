@@ -161,48 +161,39 @@ class MLMOEMOSegmentationModel(nn.Module):
     Complete Multi-Level Multi-Objective Electromagnetism-like Optimization Model
     for whole-image breast cancer segmentation.
     """
-    def __init__(
-        self,
-        encoder_name: str = "resnet18",
-        encoder_weights: str = "imagenet",
-        num_classes: int = 1,
-        num_particles: int = 2,
-        hidden_dim: int = 64,
-        emo_iterations: int = 2
-    ):
+    def __init__(self,
+                 encoder_name: str = "resnet18",
+                 encoder_weights: str = "imagenet",
+                 num_classes: int = 1,
+                 num_particles: int = 2,
+                 hidden_dim: int = 64,
+                 emo_iterations: int = 2):
         super().__init__()
-        
+
         self.num_particles = num_particles
         self.emo_iterations = emo_iterations
-        
+        self.hidden_dim = hidden_dim
+
         # Multi-level feature extraction
         self.feature_extractor = MultiLevelFeatureExtractor(
             encoder_name=encoder_name,
             encoder_weights=encoder_weights
         )
-        
+
         encoder_channels = self.feature_extractor.encoder_channels
-        # encoder_channels: [3, 64, 64, 128, 256, 512] for ResNet34
-        
-        # Decoder channels
+
+        # Decoder channels (kept moderate to allow smaller models)
         self.decoder_channels = [256, 128, 64, 32, 16]
         self.decoder = nn.ModuleList()
-        
-        # Build decoder blocks
-        # Decoder 0: 512 -> 256 (no skip)
-        # Decoder 1: 256 + 256 -> 128 (skip from encoder[4])
-        # Decoder 2: 128 + 128 -> 64 (skip from encoder[3])
-        # Decoder 3: 64 + 64 -> 32 (skip from encoder[2])
-        # Decoder 4: 32 + 64 -> 16 (skip from encoder[1])
-        
+
         decoder_in_channels = [
-            512,  # First decoder block
-            256 + 256,  # decoder[0] out + encoder[4]
-            128 + 128,  # decoder[1] out + encoder[3]
-            64 + 64,    # decoder[2] out + encoder[2]
-            32 + 64     # decoder[3] out + encoder[1]
+            512,
+            256 + 256,
+            128 + 128,
+            64 + 64,
+            32 + 64
         ]
-        
+
         for in_ch, out_ch in zip(decoder_in_channels, self.decoder_channels):
             block = nn.Sequential(
                 nn.Conv2d(in_ch, out_ch, 3, padding=1),
@@ -213,15 +204,15 @@ class MLMOEMOSegmentationModel(nn.Module):
                 nn.ReLU(inplace=True)
             )
             self.decoder.append(block)
-        
+
         decoder_out_channels = 16
-        
+
         # Electromagnetic particles for optimization
         self.particles = nn.ModuleList([
             ElectromagneticParticle(decoder_out_channels, hidden_dim)
             for _ in range(num_particles)
         ])
-        
+
         # Feature fusion after EMO
         self.emo_fusion = nn.Sequential(
             nn.Conv2d(hidden_dim * num_particles, hidden_dim, 1),
@@ -231,13 +222,13 @@ class MLMOEMOSegmentationModel(nn.Module):
             nn.BatchNorm2d(hidden_dim),
             nn.ReLU(inplace=True)
         )
-        
+
         # Multi-objective optimization module
         self.multi_objective = MultiObjectiveOptimizationModule(
             in_channels=hidden_dim,
             num_classes=num_classes
         )
-        
+
         # Final segmentation head
         self.segmentation_head = nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
         
@@ -474,7 +465,8 @@ def create_mlmo_emo_model(
     encoder_weights: str = "imagenet",
     num_classes: int = 1,
     num_particles: int = 2,
-    emo_iterations: int = 2
+    emo_iterations: int = 2,
+    hidden_dim: int = 64
 ) -> MLMOEMOSegmentationModel:
     """
     Factory function to create MLMO-EMO model.
@@ -484,7 +476,8 @@ def create_mlmo_emo_model(
         encoder_weights=encoder_weights,
         num_classes=num_classes,
         num_particles=num_particles,
-        emo_iterations=emo_iterations
+        emo_iterations=emo_iterations,
+        hidden_dim=hidden_dim
     )
     return model
 
