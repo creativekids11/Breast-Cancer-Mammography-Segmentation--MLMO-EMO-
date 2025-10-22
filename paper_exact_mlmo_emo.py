@@ -165,7 +165,7 @@ class ElectromagnetismLikeOptimizer:
     
     def __init__(self, 
                  population_size: int = 50,
-                 max_iterations: int = 50,
+                 max_iterations: int = 100,
                  local_search_prob: float = 0.8,
                  force_constant: float = 1.0):
         """
@@ -526,7 +526,12 @@ class PaperSegmentationModel:
             Segmentation results
         """
         print("Starting segmentation pipeline...")
-        
+        # Debug: show incoming image info
+        try:
+            print(f"[DEBUG] input image shape: {image.shape}, dtype: {image.dtype}, min: {np.min(image)}, max: {np.max(image)}")
+        except Exception:
+            print(f"[DEBUG] input image info unavailable")
+
         # Step 1: Image preprocessing (Section 3.2)
         print("Applying preprocessing...")
         preprocessing_results = self.preprocessor.preprocess_mammogram(image)
@@ -545,6 +550,14 @@ class PaperSegmentationModel:
             optimization_results['best_thresholds'],
             num_thresholds
         )
+
+        # Debug: log threshold and segmented mask stats
+        try:
+            print(f"[DEBUG] best_thresholds: {optimization_results['best_thresholds']}")
+            uniq_vals = np.unique(segmented_image)
+            print(f"[DEBUG] segmented unique values: {uniq_vals}, shape: {segmented_image.shape}")
+        except Exception:
+            print("[DEBUG] Could not log segmentation stats")
         
         return {
             'preprocessed': enhanced_image,

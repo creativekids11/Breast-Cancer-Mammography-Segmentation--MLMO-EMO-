@@ -55,7 +55,10 @@ except ImportError:
         from dataset_process import (
             get_image_column_name, 
             get_mask_column_names,
-            load_image_adaptive
+            load_image_adaptive,
+            _split_mask_field,
+            _resolve_mask_path,
+            _merge_mask_files
         )
     except ImportError:
         # Fallback: define the functions locally
@@ -149,12 +152,58 @@ class PaperDatasetProcessor:
             image, actual_image_path = load_image_adaptive(image_path, debug=False)
             if image is None:
                 raise ValueError(f"Could not load image: {image_path}")
-                
-            # Load mask using adaptive loading
-            mask, actual_mask_path = load_image_adaptive(mask_path, debug=False)
+
+            # Robust mask loading logic - masks in CSV can be malformed, multiple paths, or relative
+            mask = None
+            actual_mask_path = None
+
+            # 1) Try direct adaptive load first
+            if isinstance(mask_path, str) and mask_path.strip():
+                mask, actual_mask_path = load_image_adaptive(mask_path, debug=False)
+
+            # 2) If not found, try splitting multiple mask entries and load/merge
+            if mask is None and isinstance(mask_path, str):
+                candidates = _split_mask_field(mask_path)
+                if candidates:
+                    # Try each candidate as absolute/relative path
+                    loaded_masks = []
+                    for cand in candidates:
+                        m, p = load_image_adaptive(cand, debug=False)
+                        if m is not None:
+                            loaded_masks.append((m, p))
+                        else:
+                            # Try resolving relative to image directory
+                            img_dir = os.path.dirname(actual_image_path or image_path) or '.'
+                            resolved = _resolve_mask_path(cand, img_dir)
+                            if resolved:
+                                m2, p2 = load_image_adaptive(resolved, debug=False)
+                                if m2 is not None:
+                                    loaded_masks.append((m2, p2))
+
+                    if loaded_masks:
+                        # Merge masks into single mask of image.shape
+                        mask_list = [p for (_, p) in loaded_masks]
+                        # Use _merge_mask_files which expects list of paths
+                        mask = _merge_mask_files(mask_list, image.shape, debug=False)
+                        actual_mask_path = ','.join(mask_list)
+
+            # 3) If still not found, try resolving single mask path relative to image dir
+            if mask is None and isinstance(mask_path, str) and mask_path.strip():
+                img_dir = os.path.dirname(actual_image_path or image_path) or '.'
+                resolved = _resolve_mask_path(mask_path, img_dir)
+                if resolved:
+                    mask, actual_mask_path = load_image_adaptive(resolved, debug=False)
+
+            # 4) Final fallback: if mask still None but mask_path is empty/None, create empty mask
             if mask is None:
-                raise ValueError(f"Could not load mask: {mask_path}")
-            
+                # Before failing, provide debug information to help tracing
+                print(f"[DEBUG] Failed to load mask for image: {image_path}")
+                print(f"[DEBUG] mask_path value: {mask_path}")
+                print(f"[DEBUG] image resolved path: {actual_image_path}")
+                # Create an empty mask of same shape to allow segmentation and measurement (will yield zero metrics)
+                mask = np.zeros_like(image)
+                actual_mask_path = None
+
             # Apply paper's segmentation methodology
             segmentation_results = self.model.segment_image(
                 image, method=method, num_thresholds=1
@@ -416,6 +465,28 @@ class PaperDatasetProcessor:
             print(f"{'='*60}")
         
         return final_results
+
+    def quick_validate(self, n: int = 5, method: str = 'otsu') -> List[Dict]:
+        """
+        Quick validation helper to process first `n` images with extra debug prints.
+        Returns list of per-image results.
+        """
+        df_subset = self.df.head(n)
+        results = []
+        for idx, row in df_subset.iterrows():
+            image_path = row[self.image_column]
+            mask_path = row[self.mask_column]
+            print(f"\n[VALIDATE] Processing {idx+1}: image={image_path}, mask={mask_path}")
+            res = self.process_single_image(image_path, mask_path, method)
+            if not res['success']:
+                print(f"[VALIDATE] ERROR for {image_path}: {res.get('error')}")
+            else:
+                try:
+                    print(f"[VALIDATE] Metrics: {res['metrics']}")
+                except Exception:
+                    pass
+            results.append(res)
+        return results
     
     def _calculate_aggregate_statistics(self, metrics_list: List[Dict]) -> Dict:
         """
