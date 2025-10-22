@@ -22,34 +22,30 @@ import segmentation_models_pytorch as smp
 
 class ElectromagneticParticle(nn.Module):
     """
-    Represents a particle in the electromagnetic field that helps optimize
-    segmentation decisions through attraction-repulsion forces.
+    Lightweight electromagnetic particle for efficient segmentation optimization.
+    Reduced computational complexity while maintaining core functionality.
     """
-    def __init__(self, in_channels: int, hidden_dim: int = 256):
+    def __init__(self, in_channels: int, hidden_dim: int = 128):
         super().__init__()
+        # Simplified position encoder - single conv layer
         self.position_encoder = nn.Sequential(
             nn.Conv2d(in_channels, hidden_dim, 3, padding=1),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
             nn.BatchNorm2d(hidden_dim),
             nn.ReLU(inplace=True)
         )
         
-        # Charge calculation (represents segmentation confidence)
+        # Lightweight charge calculation
         self.charge_net = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim // 2, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim // 2, 1, 1),
+            nn.Conv2d(hidden_dim, 1, 1),
             nn.Sigmoid()
         )
         
-        # Force calculation network - takes concatenated positions
+        # Simplified force calculation - lightweight
         self.force_net = nn.Sequential(
-            nn.Conv2d(hidden_dim * 2, hidden_dim, 1),
+            nn.Conv2d(hidden_dim * 2, hidden_dim // 2, 1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, hidden_dim, 1),
-            nn.Tanh()  # Output in [-1, 1] for force direction
+            nn.Conv2d(hidden_dim // 2, hidden_dim, 1),
+            nn.Tanh()
         )
         
     def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -110,48 +106,38 @@ class MultiLevelFeatureExtractor(nn.Module):
 
 class MultiObjectiveOptimizationModule(nn.Module):
     """
-    Optimizes multiple objectives simultaneously:
-    1. Segmentation accuracy
-    2. Boundary smoothness
-    3. Region homogeneity
+    Lightweight multi-objective optimization for efficiency.
+    Simplified version with shared backbone.
     """
     def __init__(self, in_channels: int, num_classes: int = 1):
         super().__init__()
         
-        # Objective 1: Accuracy - main segmentation head
-        self.accuracy_head = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // 2, 3, padding=1),
-            nn.BatchNorm2d(in_channels // 2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // 2, num_classes, 1)
+        # Shared backbone to reduce computation
+        self.shared_backbone = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 4, 3, padding=1),
+            nn.BatchNorm2d(in_channels // 4),
+            nn.ReLU(inplace=True)
         )
         
-        # Objective 2: Boundary quality
-        self.boundary_head = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // 2, 3, padding=1),
-            nn.BatchNorm2d(in_channels // 2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // 2, num_classes, 1)
-        )
+        shared_channels = in_channels // 4
         
-        # Objective 3: Region homogeneity
-        self.homogeneity_head = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // 2, 3, padding=1),
-            nn.BatchNorm2d(in_channels // 2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // 2, num_classes, 1)
-        )
+        # Lightweight objective heads
+        self.accuracy_head = nn.Conv2d(shared_channels, num_classes, 1)
+        self.boundary_head = nn.Conv2d(shared_channels, num_classes, 1)
+        self.homogeneity_head = nn.Conv2d(shared_channels, num_classes, 1)
         
         # Learnable weights for combining objectives
         self.objective_weights = nn.Parameter(torch.ones(3) / 3.0)
         
     def forward(self, features: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        Compute all objectives and combine them.
+        Compute all objectives with shared backbone for efficiency.
         """
-        accuracy_out = self.accuracy_head(features)
-        boundary_out = self.boundary_head(features)
-        homogeneity_out = self.homogeneity_head(features)
+        shared_features = self.shared_backbone(features)
+        
+        accuracy_out = self.accuracy_head(shared_features)
+        boundary_out = self.boundary_head(shared_features)
+        homogeneity_out = self.homogeneity_head(shared_features)
         
         # Normalize weights
         weights = F.softmax(self.objective_weights, dim=0)
@@ -177,12 +163,12 @@ class MLMOEMOSegmentationModel(nn.Module):
     """
     def __init__(
         self,
-        encoder_name: str = "resnet34",
+        encoder_name: str = "resnet18",
         encoder_weights: str = "imagenet",
         num_classes: int = 1,
-        num_particles: int = 3,
-        hidden_dim: int = 256,
-        emo_iterations: int = 3
+        num_particles: int = 2,
+        hidden_dim: int = 64,
+        emo_iterations: int = 2
     ):
         super().__init__()
         
@@ -379,20 +365,22 @@ class MLMOEMOSegmentationModel(nn.Module):
 
 class MLMOEMOLoss(nn.Module):
     """
-    Custom loss function for MLMO-EMO model that combines multiple objectives.
+    Custom loss function for MLMO-EMO model with L1 regularization to prevent overfitting.
     """
     def __init__(
         self,
         dice_weight: float = 1.0,
         bce_weight: float = 1.0,
-        boundary_weight: float = 0.5,
-        homogeneity_weight: float = 0.3
+        boundary_weight: float = 0.3,
+        homogeneity_weight: float = 0.2,
+        l1_weight: float = 1e-5
     ):
         super().__init__()
         self.dice_weight = dice_weight
         self.bce_weight = bce_weight
         self.boundary_weight = boundary_weight
         self.homogeneity_weight = homogeneity_weight
+        self.l1_weight = l1_weight
         
         self.bce_loss = nn.BCEWithLogitsLoss()
         
@@ -430,10 +418,18 @@ class MLMOEMOLoss(nn.Module):
         
         return pred_variance
     
+    def l1_regularization(self, model: nn.Module) -> torch.Tensor:
+        """Compute L1 regularization loss to prevent overfitting."""
+        l1_loss = 0
+        for param in model.parameters():
+            l1_loss += torch.sum(torch.abs(param))
+        return l1_loss
+    
     def forward(
         self,
         outputs: Dict[str, torch.Tensor],
-        target: torch.Tensor
+        target: torch.Tensor,
+        model: nn.Module = None
     ) -> Dict[str, torch.Tensor]:
         """
         Compute total loss combining all objectives.
@@ -449,12 +445,18 @@ class MLMOEMOLoss(nn.Module):
         boundary = self.boundary_loss(multi_obj['boundary'], target)
         homogeneity = self.homogeneity_loss(multi_obj['homogeneity'], target)
         
+        # L1 regularization loss (if model provided)
+        l1_loss = 0
+        if model is not None and self.l1_weight > 0:
+            l1_loss = self.l1_regularization(model)
+        
         # Combined loss
         total_loss = (
             self.dice_weight * dice +
             self.bce_weight * bce +
             self.boundary_weight * boundary +
-            self.homogeneity_weight * homogeneity
+            self.homogeneity_weight * homogeneity +
+            self.l1_weight * l1_loss
         )
         
         return {
@@ -462,16 +464,17 @@ class MLMOEMOLoss(nn.Module):
             'dice': dice,
             'bce': bce,
             'boundary': boundary,
-            'homogeneity': homogeneity
+            'homogeneity': homogeneity,
+            'l1': l1_loss
         }
 
 
 def create_mlmo_emo_model(
-    encoder_name: str = "resnet34",
+    encoder_name: str = "resnet18",
     encoder_weights: str = "imagenet",
     num_classes: int = 1,
-    num_particles: int = 3,
-    emo_iterations: int = 3
+    num_particles: int = 2,
+    emo_iterations: int = 2
 ) -> MLMOEMOSegmentationModel:
     """
     Factory function to create MLMO-EMO model.
