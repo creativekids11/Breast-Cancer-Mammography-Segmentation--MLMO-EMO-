@@ -33,6 +33,57 @@ except ImportError:
         PaperPreprocessor
     )
 
+# Import adaptive column detection functions
+try:
+    # Try importing from parent directory
+    import sys
+    sys.path.append('..')
+    from dataset_process import (
+        get_image_column_name, 
+        get_mask_column_names,
+        load_image_adaptive
+    )
+except ImportError:
+    try:
+        # Try importing from current directory
+        sys.path.append('.')
+        from dataset_process import (
+            get_image_column_name, 
+            get_mask_column_names,
+            load_image_adaptive
+        )
+    except ImportError:
+        # Fallback: define the functions locally
+        def get_image_column_name(columns, debug=False):
+            """Fallback function to detect image column."""
+            image_patterns = [
+                'image_path', 'image_file_path', 'fullPath', 'fileName', 
+                'imagePath', 'file_path', 'path'
+            ]
+            for pattern in image_patterns:
+                for col in columns:
+                    if pattern.lower() in col.lower():
+                        return col
+            return columns[0] if columns else None
+            
+        def get_mask_column_names(columns, debug=False):
+            """Fallback function to detect mask columns."""
+            mask_columns = []
+            mask_patterns = [
+                'mask_path', 'roi_mask_file_path', 'Tumour_Contour', 'mask'
+            ]
+            for pattern in mask_patterns:
+                for col in columns:
+                    if pattern.lower() in col.lower():
+                        mask_columns.append(col)
+            return mask_columns
+            
+        def load_image_adaptive(path, debug=False):
+            """Fallback function to load images."""
+            import cv2
+            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            return img, path if img is not None else (None, None)
+
 
 class PaperDatasetProcessor:
     """
@@ -50,6 +101,26 @@ class PaperDatasetProcessor:
         self.model = PaperSegmentationModel()
         self.metrics_calculator = PaperEvaluationMetrics()
         
+        # Detect column names adaptively
+        columns = self.df.columns.tolist()
+        print(f"Available columns: {columns}")
+        
+        # Detect image column
+        self.image_column = get_image_column_name(columns, debug=True)
+        if self.image_column is None:
+            raise ValueError(f"Could not detect image column in: {columns}")
+        print(f"Using image column: {self.image_column}")
+        
+        # Detect mask columns
+        self.mask_columns = get_mask_column_names(columns, debug=True)
+        if not self.mask_columns:
+            raise ValueError(f"Could not detect mask columns in: {columns}")
+        print(f"Using mask columns: {self.mask_columns}")
+        
+        # Use the first mask column as primary
+        self.mask_column = self.mask_columns[0]
+        print(f"Primary mask column: {self.mask_column}")
+        
     def process_single_image(self, image_path: str, mask_path: str, 
                            method: str = 'otsu') -> Dict:
         """
@@ -64,12 +135,13 @@ class PaperDatasetProcessor:
             Processing results including metrics
         """
         try:
-            # Load image and mask
-            image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+            # Load image using adaptive loading
+            image, actual_image_path = load_image_adaptive(image_path, debug=False)
             if image is None:
                 raise ValueError(f"Could not load image: {image_path}")
                 
-            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            # Load mask using adaptive loading
+            mask, actual_mask_path = load_image_adaptive(mask_path, debug=False)
             if mask is None:
                 raise ValueError(f"Could not load mask: {mask_path}")
             
@@ -137,8 +209,9 @@ class PaperDatasetProcessor:
                            total=len(df_subset),
                            desc="Processing images"):
             
-            image_path = row['image_path']
-            mask_path = row['mask_path']
+            # Use adaptive column names
+            image_path = row[self.image_column]
+            mask_path = row[self.mask_column]
             
             # Process single image
             result = self.process_single_image(image_path, mask_path, method)
