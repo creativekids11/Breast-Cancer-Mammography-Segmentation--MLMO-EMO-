@@ -16,6 +16,8 @@ import matplotlib.pyplot as plt
 from typing import List, Dict, Tuple
 import json
 from datetime import datetime
+import pickle
+import shutil
 
 cv2.setUseOptimized(True)
 cv2.setNumThreads(4)  # Use 4 CPU threads
@@ -93,16 +95,21 @@ class PaperDatasetProcessor:
     Dataset processor that works with the exact paper methodology.
     """
     
-    def __init__(self, dataset_csv: str):
+    def __init__(self, dataset_csv: str, checkpoint_dir: str = "checkpoints"):
         """
         Initialize with dataset CSV file.
         
         Args:
             dataset_csv: Path to CSV file with image and mask paths
+            checkpoint_dir: Directory to save checkpoints (default: "checkpoints")
         """
         self.df = pd.read_csv(dataset_csv)
         self.model = PaperSegmentationModel()
         self.metrics_calculator = PaperEvaluationMetrics()
+        
+        # Setup checkpoint directory
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.checkpoint_dir.mkdir(exist_ok=True)
         
         # Detect column names adaptively
         columns = self.df.columns.tolist()
@@ -184,16 +191,158 @@ class PaperDatasetProcessor:
                 'metrics': None
             }
     
+    def _save_checkpoint(self, results: List[Dict], all_metrics: List[Dict], 
+                        processed_count: int, method: str):
+        """
+        Save checkpoint to enable resuming from interruptions.
+        
+        Args:
+            results: List of processing results
+            all_metrics: List of metrics dictionaries
+            processed_count: Number of images processed
+            method: Thresholding method used
+        """
+        checkpoint_file = self.checkpoint_dir / f"checkpoint_{method}_{processed_count}.pkl"
+        checkpoint_data = {
+            'results': results,
+            'all_metrics': all_metrics,
+            'processed_count': processed_count,
+            'method': method,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        with open(checkpoint_file, 'wb') as f:
+            pickle.dump(checkpoint_data, f)
+        
+        print(f"Checkpoint saved: {checkpoint_file}")
+        
+        # Keep only last 3 checkpoints to save disk space
+        self._cleanup_old_checkpoints(method, keep_last=3)
+    
+    def _cleanup_old_checkpoints(self, method: str, keep_last: int = 3):
+        """Remove old checkpoint files, keeping only the most recent ones."""
+        checkpoint_files = sorted(
+            self.checkpoint_dir.glob(f"checkpoint_{method}_*.pkl"),
+            key=lambda x: x.stat().st_mtime,
+            reverse=True
+        )
+        
+        for old_checkpoint in checkpoint_files[keep_last:]:
+            try:
+                old_checkpoint.unlink()
+                print(f"Removed old checkpoint: {old_checkpoint.name}")
+            except Exception as e:
+                print(f"Warning: Could not remove {old_checkpoint.name}: {e}")
+    
+    def _load_latest_checkpoint(self, method: str) -> Tuple[List[Dict], List[Dict], int]:
+        """
+        Load the most recent checkpoint for resuming processing.
+        
+        Args:
+            method: Thresholding method to load checkpoint for
+            
+        Returns:
+            Tuple of (results, all_metrics, processed_count) or ([], [], 0) if no checkpoint
+        """
+        checkpoint_files = sorted(
+            self.checkpoint_dir.glob(f"checkpoint_{method}_*.pkl"),
+            key=lambda x: x.stat().st_mtime,
+            reverse=True
+        )
+        
+        if not checkpoint_files:
+            return [], [], 0
+        
+        latest_checkpoint = checkpoint_files[0]
+        print(f"Loading checkpoint: {latest_checkpoint}")
+        
+        try:
+            with open(latest_checkpoint, 'rb') as f:
+                checkpoint_data = pickle.load(f)
+            
+            print(f"Resumed from {checkpoint_data['processed_count']} images")
+            print(f"Checkpoint timestamp: {checkpoint_data['timestamp']}")
+            
+            return (
+                checkpoint_data['results'],
+                checkpoint_data['all_metrics'],
+                checkpoint_data['processed_count']
+            )
+        except Exception as e:
+            print(f"Warning: Could not load checkpoint {latest_checkpoint}: {e}")
+            return [], [], 0
+    
+    def _save_results(self, final_results: Dict, method: str, output_dir: str = "results"):
+        """
+        Save processing results in multiple formats.
+        
+        Args:
+            final_results: Complete processing results dictionary
+            method: Thresholding method used
+            output_dir: Directory to save results
+        """
+        output_path = Path(output_dir)
+        output_path.mkdir(exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_filename = f"results_{method}_{timestamp}"
+        
+        # Save as JSON (summary)
+        json_file = output_path / f"{base_filename}.json"
+        json_data = {
+            'method': final_results['method'],
+            'total_images': final_results['total_images'],
+            'successful_processing': final_results['successful_processing'],
+            'success_rate': final_results['success_rate'],
+            'aggregate_metrics': final_results['aggregate_metrics'],
+            'processing_timestamp': final_results['processing_timestamp']
+        }
+        
+        with open(json_file, 'w') as f:
+            json.dump(json_data, f, indent=4)
+        print(f"JSON summary saved: {json_file}")
+        
+        # Save detailed results as pickle (includes all data)
+        pickle_file = output_path / f"{base_filename}_detailed.pkl"
+        with open(pickle_file, 'wb') as f:
+            pickle.dump(final_results, f)
+        print(f"Detailed results saved: {pickle_file}")
+        
+        # Save metrics as CSV for easy analysis
+        if final_results['detailed_results']:
+            csv_file = output_path / f"{base_filename}_metrics.csv"
+            metrics_rows = []
+            
+            for result in final_results['detailed_results']:
+                if result['success'] and result['metrics']:
+                    row = {
+                        'image_path': result['image_path'],
+                        'mask_path': result['mask_path'],
+                        **result['metrics']
+                    }
+                    metrics_rows.append(row)
+            
+            if metrics_rows:
+                metrics_df = pd.DataFrame(metrics_rows)
+                metrics_df.to_csv(csv_file, index=False)
+                print(f"Metrics CSV saved: {csv_file}")
+        
+        return json_file, pickle_file
+    
     def process_dataset(self, method: str = 'otsu', 
                        max_images: int = None,
-                       save_results: bool = True) -> Dict:
+                       save_results: bool = True,
+                       resume_from_checkpoint: bool = True,
+                       checkpoint_interval: int = 10) -> Dict:
         """
-        Process entire dataset using paper methodology.
+        Process entire dataset using paper methodology with checkpointing.
         
         Args:
             method: 'otsu' or 'kapur' thresholding method
             max_images: Maximum number of images to process (None for all)
             save_results: Whether to save detailed results
+            resume_from_checkpoint: Whether to resume from last checkpoint
+            checkpoint_interval: Save checkpoint every N images (default: 10)
             
         Returns:
             Aggregated results and statistics
@@ -204,13 +353,25 @@ class PaperDatasetProcessor:
         # Limit number of images if specified
         df_subset = self.df.head(max_images) if max_images else self.df
         
+        # Try to load checkpoint if resuming
         results = []
         all_metrics = []
+        start_idx = 0
+        
+        if resume_from_checkpoint:
+            results, all_metrics, start_idx = self._load_latest_checkpoint(method)
+            if start_idx > 0:
+                print(f"Resuming from image {start_idx + 1}/{len(df_subset)}")
         
         # Process each image with progress bar
         for idx, row in tqdm(df_subset.iterrows(), 
                            total=len(df_subset),
-                           desc="Processing images"):
+                           desc="Processing images",
+                           initial=start_idx):
+            
+            # Skip already processed images
+            if idx < start_idx:
+                continue
             
             # Use adaptive column names
             image_path = row[self.image_column]
@@ -224,10 +385,14 @@ class PaperDatasetProcessor:
             if result['success'] and result['metrics']:
                 all_metrics.append(result['metrics'])
             
-            # Print progress every 10 images
-            if (idx + 1) % 10 == 0:
+            # Save checkpoint at regular intervals
+            if (idx + 1) % checkpoint_interval == 0:
                 success_rate = sum(1 for r in results if r['success']) / len(results)
                 print(f"Processed {idx + 1} images, success rate: {success_rate:.2%}")
+                self._save_checkpoint(results, all_metrics, idx + 1, method)
+        
+        # Save final checkpoint
+        self._save_checkpoint(results, all_metrics, len(df_subset), method)
         
         # Calculate aggregate statistics
         aggregate_stats = self._calculate_aggregate_statistics(all_metrics)
@@ -242,6 +407,13 @@ class PaperDatasetProcessor:
             'detailed_results': results if save_results else None,
             'processing_timestamp': datetime.now().isoformat()
         }
+        
+        # Save results in multiple formats
+        if save_results:
+            self._save_results(final_results, method)
+            print(f"\n{'='*60}")
+            print("Results saved successfully!")
+            print(f"{'='*60}")
         
         return final_results
     
@@ -366,6 +538,15 @@ def main():
     parser.add_argument('--save-detailed', action='store_true',
                        help='Save detailed results for each image')
     
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',
+                       help='Directory for saving checkpoints (default: checkpoints)')
+    
+    parser.add_argument('--checkpoint-interval', type=int, default=10,
+                       help='Save checkpoint every N images (default: 10)')
+    
+    parser.add_argument('--no-resume', action='store_true',
+                       help='Do not resume from checkpoint (start fresh)')
+    
     args = parser.parse_args()
     
     # Create output directory
@@ -376,32 +557,35 @@ def main():
         raise FileNotFoundError(f"Dataset CSV not found: {args.csv_path}")
     
     print("Starting MLMO-EMO Paper Exact Implementation")
-    print("-" * 50)
+    print("=" * 60)
     print(f"Dataset CSV: {args.csv_path}")
     print(f"Method: {args.method}")
     print(f"Max images: {args.max_images or 'All'}")
     print(f"Output directory: {args.output_dir}")
+    print(f"Checkpoint directory: {args.checkpoint_dir}")
+    print(f"Checkpoint interval: {args.checkpoint_interval} images")
+    print(f"Resume from checkpoint: {not args.no_resume}")
+    print("=" * 60)
     
-    # Initialize processor
-    processor = PaperDatasetProcessor(args.csv_path)
+    # Initialize processor with checkpoint directory
+    processor = PaperDatasetProcessor(args.csv_path, 
+                                     checkpoint_dir=args.checkpoint_dir)
     
-    # Process dataset
+    # Process dataset with checkpointing
     results = processor.process_dataset(
         method=args.method,
         max_images=args.max_images,
-        save_results=args.save_detailed
+        save_results=args.save_detailed,
+        resume_from_checkpoint=not args.no_resume,
+        checkpoint_interval=args.checkpoint_interval
     )
     
     # Print summary
     processor.print_summary(results)
     
-    # Save results
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = os.path.join(args.output_dir, 
-                              f"mlmo_emo_results_{args.method}_{timestamp}.json")
-    processor.save_results(results, output_file)
-    
-    print(f"\nProcessing complete! Results saved to {output_file}")
+    print(f"\n{'='*60}")
+    print("Processing complete!")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
