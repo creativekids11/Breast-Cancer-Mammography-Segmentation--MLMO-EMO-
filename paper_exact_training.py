@@ -18,11 +18,20 @@ import json
 from datetime import datetime
 
 # Import the exact paper implementation
-from .paper_exact_mlmo_emo import (
-    PaperSegmentationModel, 
-    PaperEvaluationMetrics,
-    PaperPreprocessor
-)
+try:
+    # Try relative import (when run as module)
+    from paper_exact_mlmo_emo import (
+        PaperSegmentationModel, 
+        PaperEvaluationMetrics,
+        PaperPreprocessor
+    )
+except ImportError:
+    # Try absolute import (when run directly)
+    from paper_exact_mlmo_emo import (
+        PaperSegmentationModel, 
+        PaperEvaluationMetrics,
+        PaperPreprocessor
+    )
 
 
 class PaperDatasetProcessor:
