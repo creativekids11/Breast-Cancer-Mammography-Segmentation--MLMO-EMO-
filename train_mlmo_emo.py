@@ -20,6 +20,7 @@ from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 
 from mlmo_emo_segmentation import create_mlmo_emo_model, MLMOEMOLoss
+from torch.cuda.amp import autocast, GradScaler
 
 
 class MammographyDataset(Dataset):
@@ -235,8 +236,8 @@ def calculate_metrics(pred, target, threshold=0.5):
     }
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, epoch, gradient_accumulation_steps=4):
-    """Train for one epoch."""
+def train_epoch(model, dataloader, criterion, optimizer, device, epoch, gradient_accumulation_steps=4, use_amp=False, scaler=None):
+    """Train for one epoch with optional mixed precision."""
     model.train()
     
     running_loss = 0.0
@@ -256,19 +257,30 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, gradient
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
         
-        # Forward pass
-        outputs = model(images)
-        
-        # Calculate loss
-        losses = criterion(outputs, masks)
-        loss = losses['total'] / gradient_accumulation_steps
+        # Forward pass with optional mixed precision
+        if use_amp:
+            with autocast():
+                outputs = model(images)
+                losses = criterion(outputs, masks, model)
+                loss = losses['total'] / gradient_accumulation_steps
+        else:
+            outputs = model(images)
+            losses = criterion(outputs, masks, model)
+            loss = losses['total'] / gradient_accumulation_steps
         
         # Backward pass
-        loss.backward()
+        if use_amp and scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
         
         # Update weights every gradient_accumulation_steps
         if (batch_idx + 1) % gradient_accumulation_steps == 0:
-            optimizer.step()
+            if use_amp and scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
             optimizer.zero_grad()
         
         # Calculate metrics
@@ -288,7 +300,11 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, gradient
     
     # Final optimizer step if there are remaining gradients
     if len(dataloader) % gradient_accumulation_steps != 0:
-        optimizer.step()
+        if use_amp and scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         optimizer.zero_grad()
     
     # Calculate epoch averages
@@ -323,8 +339,8 @@ def validate_epoch(model, dataloader, criterion, device, epoch):
             # Forward pass
             outputs = model(images)
             
-            # Calculate loss
-            losses = criterion(outputs, masks)
+            # Calculate loss (pass model for L1 regularization)
+            losses = criterion(outputs, masks, model)
             loss = losses['total']
             
             # Calculate metrics
@@ -464,8 +480,12 @@ def main():
     # Loss weights
     parser.add_argument('--dice-weight', type=float, default=1.0)
     parser.add_argument('--bce-weight', type=float, default=1.0)
-    parser.add_argument('--boundary-weight', type=float, default=0.5)
-    parser.add_argument('--homogeneity-weight', type=float, default=0.3)
+    parser.add_argument('--boundary-weight', type=float, default=0.3)
+    parser.add_argument('--homogeneity-weight', type=float, default=0.2)
+    parser.add_argument('--l1-weight', type=float, default=1e-5,
+                       help='L1 regularization weight to prevent overfitting')
+    parser.add_argument('--use-amp', action='store_true',
+                       help='Use automatic mixed precision for memory efficiency')
     
     # Checkpoint arguments
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints_mlmo_emo',
@@ -558,7 +578,8 @@ def main():
         dice_weight=args.dice_weight,
         bce_weight=args.bce_weight,
         boundary_weight=args.boundary_weight,
-        homogeneity_weight=args.homogeneity_weight
+        homogeneity_weight=args.homogeneity_weight,
+        l1_weight=args.l1_weight
     )
     
     # Create optimizer
@@ -568,6 +589,9 @@ def main():
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=10
     )
+    
+    # Mixed precision scaler
+    scaler = GradScaler() if args.use_amp and torch.cuda.is_available() else None
     
     # Resume from checkpoint if provided
     start_epoch = 0
@@ -596,7 +620,8 @@ def main():
         
         # Train
         train_loss, train_metrics = train_epoch(
-            model, train_loader, criterion, optimizer, device, epoch+1, args.gradient_accumulation_steps
+            model, train_loader, criterion, optimizer, device, epoch+1, 
+            args.gradient_accumulation_steps, args.use_amp, scaler
         )
         
         # Validate
