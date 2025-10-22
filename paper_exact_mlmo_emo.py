@@ -164,9 +164,10 @@ class ElectromagnetismLikeOptimizer:
     """
     
     def __init__(self, 
-                 population_size: int = 50,
-                 max_iterations: int = 100,
-                 local_search_prob: float = 0.8,
+                 population_size: int = 30,  # Reduced from 50 for speed
+                 max_iterations: int = 50,   # Reduced from 100 for speed
+                 local_search_prob: float = 0.5,  # Reduced from 0.8
+                 local_search_iterations: int = 3,  # Reduced from 5
                  force_constant: float = 1.0):
         """
         Initialize EML optimizer with paper parameters.
@@ -175,11 +176,13 @@ class ElectromagnetismLikeOptimizer:
             population_size: Number of particles (N in paper)
             max_iterations: Number of iterations (g = 100 in paper)
             local_search_prob: Probability of local search
+            local_search_iterations: Number of local search iterations
             force_constant: Electromagnetic force constant
         """
         self.N = population_size
         self.max_iterations = max_iterations
         self.local_search_prob = local_search_prob
+        self.local_search_iterations = local_search_iterations
         self.force_constant = force_constant
         # Performance optimization: cache histogram
         self._hist_cache = None
@@ -401,7 +404,7 @@ class ElectromagnetismLikeOptimizer:
         best_fitness = self.evaluate_fitness(particle, image, method)
         
         # OPTIMIZATION: Reduced from 10 to 5 iterations for 50% speed improvement
-        for _ in range(5):
+        for _ in range(self.local_search_iterations):
             # Random perturbation
             perturbation = np.random.normal(0, 1, size=particle.shape)
             new_particle = particle + 0.1 * perturbation
@@ -442,6 +445,8 @@ class ElectromagnetismLikeOptimizer:
         best_fitness_history = []
         best_particle = None
         best_fitness = float('inf')
+        no_improvement_count = 0
+        patience = 10  # Early stopping patience
         
         print(f"Starting EML optimization with {self.max_iterations} iterations...")
         
@@ -454,11 +459,21 @@ class ElectromagnetismLikeOptimizer:
             
             # Update global best
             min_idx = np.argmin(fitness_values)
-            if fitness_values[min_idx] < best_fitness:
-                best_fitness = fitness_values[min_idx]
+            current_best_fitness = fitness_values[min_idx]
+            
+            if current_best_fitness < best_fitness:
+                best_fitness = current_best_fitness
                 best_particle = population[min_idx].copy()
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
             
             best_fitness_history.append(best_fitness)
+            
+            # Early stopping
+            if no_improvement_count >= patience:
+                print(f"Early stopping at iteration {iteration + 1} (no improvement for {patience} iterations)")
+                break
             
             # Calculate charges
             charges = self.calculate_charge(-fitness_values)  # Convert to maximization
@@ -507,10 +522,19 @@ class PaperSegmentationModel:
     Combines preprocessing, EML optimization, and template matching.
     """
     
-    def __init__(self):
+    def __init__(self, 
+                 population_size: int = 30,
+                 max_iterations: int = 50,
+                 local_search_prob: float = 0.5,
+                 local_search_iterations: int = 3):
         """Initialize the segmentation model."""
         self.preprocessor = PaperPreprocessor()
-        self.optimizer = ElectromagnetismLikeOptimizer()
+        self.optimizer = ElectromagnetismLikeOptimizer(
+            population_size=population_size,
+            max_iterations=max_iterations,
+            local_search_prob=local_search_prob,
+            local_search_iterations=local_search_iterations
+        )
     
     def segment_image(self, image: np.ndarray, method: str = 'otsu', 
                      num_thresholds: int = 1) -> Dict:

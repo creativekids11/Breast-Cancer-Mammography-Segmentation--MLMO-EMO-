@@ -98,16 +98,29 @@ class PaperDatasetProcessor:
     Dataset processor that works with the exact paper methodology.
     """
     
-    def __init__(self, dataset_csv: str, checkpoint_dir: str = "checkpoints"):
+    def __init__(self, dataset_csv: str, checkpoint_dir: str = "checkpoints",
+                 population_size: int = 30,
+                 max_iterations: int = 50,
+                 local_search_prob: float = 0.5,
+                 local_search_iterations: int = 3):
         """
         Initialize with dataset CSV file.
         
         Args:
             dataset_csv: Path to CSV file with image and mask paths
             checkpoint_dir: Directory to save checkpoints (default: "checkpoints")
+            population_size: EML optimizer population size
+            max_iterations: EML optimizer max iterations
+            local_search_prob: EML local search probability
+            local_search_iterations: EML local search iterations
         """
         self.df = pd.read_csv(dataset_csv)
-        self.model = PaperSegmentationModel()
+        self.model = PaperSegmentationModel(
+            population_size=population_size,
+            max_iterations=max_iterations,
+            local_search_prob=local_search_prob,
+            local_search_iterations=local_search_iterations
+        )
         self.metrics_calculator = PaperEvaluationMetrics()
         
         # Setup checkpoint directory
@@ -640,8 +653,17 @@ def main():
     parser.add_argument('--checkpoint-interval', type=int, default=10,
                        help='Save checkpoint every N images (default: 10)')
     
-    parser.add_argument('--no-resume', action='store_true',
-                       help='Do not resume from checkpoint (start fresh)')
+    parser.add_argument('--population-size', type=int, default=30,
+                       help='EML optimizer population size (default: 30, reduced for speed)')
+    
+    parser.add_argument('--max-iterations', type=int, default=50,
+                       help='EML optimizer max iterations (default: 50, reduced for speed)')
+    
+    parser.add_argument('--local-search-prob', type=float, default=0.5,
+                       help='EML local search probability (default: 0.5)')
+    
+    parser.add_argument('--local-search-iterations', type=int, default=3,
+                       help='EML local search iterations (default: 3)')
     
     args = parser.parse_args()
     
@@ -665,7 +687,11 @@ def main():
     
     # Initialize processor with checkpoint directory
     processor = PaperDatasetProcessor(args.csv_path, 
-                                     checkpoint_dir=args.checkpoint_dir)
+                                     checkpoint_dir=args.checkpoint_dir,
+                                     population_size=args.population_size,
+                                     max_iterations=args.max_iterations,
+                                     local_search_prob=args.local_search_prob,
+                                     local_search_iterations=args.local_search_iterations)
     
     # Process dataset with checkpointing
     results = processor.process_dataset(
