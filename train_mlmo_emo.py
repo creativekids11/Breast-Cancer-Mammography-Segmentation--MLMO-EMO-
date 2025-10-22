@@ -113,10 +113,26 @@ def load_dataset_from_csv(csv_path, data_dir, test_size=0.2):
     mask_paths = []
     
     for _, row in df.iterrows():
-        img_path = Path(data_dir) / row['image_path'] if 'image_path' in row else Path(row['image'])
-        mask_path = Path(data_dir) / row['mask_path'] if 'mask_path' in row else Path(row['mask'])
-        
-        if img_path.exists() and mask_path.exists():
+        # Get image path
+        if 'image_path' in row and pd.notna(row['image_path']):
+            img_path = Path(data_dir) / row['image_path']
+        elif 'image' in row and pd.notna(row['image']):
+            img_path = Path(row['image'])
+        elif 'image_file_path' in row and pd.notna(row['image_file_path']):
+            img_path = Path(row['image_file_path'])
+        else:
+            img_path = None
+
+        # Get mask path (support multiple possible column names)
+        mask_path = None
+        if 'mask_path' in row and pd.notna(row['mask_path']):
+            mask_path = Path(data_dir) / row['mask_path']
+        elif 'mask' in row and pd.notna(row['mask']):
+            mask_path = Path(row['mask'])
+        elif 'roi_mask_file_path' in row and pd.notna(row['roi_mask_file_path']):
+            mask_path = Path(row['roi_mask_file_path'])
+
+        if img_path is not None and mask_path is not None and img_path.exists() and mask_path.exists():
             image_paths.append(img_path)
             mask_paths.append(mask_path)
     
