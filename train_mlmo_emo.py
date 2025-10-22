@@ -72,18 +72,12 @@ def get_training_augmentation(img_size=512):
         A.Resize(img_size, img_size),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.3),
-        A.ShiftScaleRotate(
-            shift_limit=0.1,
-            scale_limit=0.1,
-            rotate_limit=15,
-            p=0.5
-        ),
         A.RandomBrightnessContrast(
             brightness_limit=0.2,
             contrast_limit=0.2,
             p=0.5
         ),
-        A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+        A.GaussNoise(var_limit=10.0, p=0.3),
         A.GaussianBlur(blur_limit=(3, 5), p=0.3),
         A.Normalize(
             mean=[0.485, 0.456, 0.406],
@@ -241,7 +235,7 @@ def calculate_metrics(pred, target, threshold=0.5):
     }
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
+def train_epoch(model, dataloader, criterion, optimizer, device, epoch, gradient_accumulation_steps=4):
     """Train for one epoch."""
     model.train()
     
@@ -256,38 +250,46 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
     }
     
     pbar = tqdm(dataloader, desc=f"Training Epoch {epoch}")
+    optimizer.zero_grad()
     
-    for images, masks in pbar:
-        images = images.to(device)
-        masks = masks.to(device)
-        
-        optimizer.zero_grad()
+    for batch_idx, (images, masks) in enumerate(pbar):
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
         
         # Forward pass
         outputs = model(images)
         
         # Calculate loss
         losses = criterion(outputs, masks)
-        loss = losses['total']
+        loss = losses['total'] / gradient_accumulation_steps
         
         # Backward pass
         loss.backward()
-        optimizer.step()
+        
+        # Update weights every gradient_accumulation_steps
+        if (batch_idx + 1) % gradient_accumulation_steps == 0:
+            optimizer.step()
+            optimizer.zero_grad()
         
         # Calculate metrics
         metrics = calculate_metrics(outputs['segmentation'], masks)
         
         # Update running stats
-        running_loss += loss.item()
+        running_loss += loss.item() * gradient_accumulation_steps
         for key in running_metrics:
             running_metrics[key] += metrics[key]
         
         # Update progress bar
         pbar.set_postfix({
-            'loss': f"{loss.item():.4f}",
+            'loss': f"{loss.item() * gradient_accumulation_steps:.4f}",
             'dice': f"{metrics['dice']:.4f}",
             'sens': f"{metrics['sensitivity']:.4f}"
         })
+    
+    # Final optimizer step if there are remaining gradients
+    if len(dataloader) % gradient_accumulation_steps != 0:
+        optimizer.step()
+        optimizer.zero_grad()
     
     # Calculate epoch averages
     num_batches = len(dataloader)
@@ -315,8 +317,8 @@ def validate_epoch(model, dataloader, criterion, device, epoch):
     
     with torch.no_grad():
         for images, masks in pbar:
-            images = images.to(device)
-            masks = masks.to(device)
+            images = images.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
             
             # Forward pass
             outputs = model(images)
@@ -436,26 +438,28 @@ def main():
                        help='Use CSV file instead of directory structure')
     
     # Model arguments
-    parser.add_argument('--encoder', type=str, default='resnet34',
+    parser.add_argument('--encoder', type=str, default='resnet18',
                        choices=['resnet18', 'resnet34', 'resnet50', 'resnet101', 
                                'efficientnet-b0', 'efficientnet-b4'],
                        help='Encoder backbone')
-    parser.add_argument('--num-particles', type=int, default=3,
+    parser.add_argument('--num-particles', type=int, default=2,
                        help='Number of electromagnetic particles')
-    parser.add_argument('--emo-iterations', type=int, default=3,
+    parser.add_argument('--emo-iterations', type=int, default=2,
                        help='Number of EMO refinement iterations')
     
     # Training arguments
     parser.add_argument('--epochs', type=int, default=150,
                        help='Number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=12,
+    parser.add_argument('--batch-size', type=int, default=1,
                        help='Batch size for training')
     parser.add_argument('--lr', type=float, default=3e-4,
                        help='Learning rate')
-    parser.add_argument('--img-size', type=int, default=512,
+    parser.add_argument('--img-size', type=int, default=256,
                        help='Input image size')
-    parser.add_argument('--num-workers', type=int, default=4,
+    parser.add_argument('--num-workers', type=int, default=2,
                        help='Number of data loading workers')
+    parser.add_argument('--gradient-accumulation-steps', type=int, default=4,
+                       help='Number of gradient accumulation steps')
     
     # Loss weights
     parser.add_argument('--dice-weight', type=float, default=1.0)
@@ -476,6 +480,12 @@ def main():
     # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+    
+    # Memory optimization
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
     
     # Load dataset
     print("\n" + "="*60)
@@ -586,7 +596,7 @@ def main():
         
         # Train
         train_loss, train_metrics = train_epoch(
-            model, train_loader, criterion, optimizer, device, epoch+1
+            model, train_loader, criterion, optimizer, device, epoch+1, args.gradient_accumulation_steps
         )
         
         # Validate
