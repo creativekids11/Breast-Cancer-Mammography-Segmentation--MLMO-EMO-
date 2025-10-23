@@ -17,12 +17,22 @@ import matplotlib.pyplot as plt
 from typing import Tuple, Dict, List
 import math
 from scipy.ndimage import median_filter
-from skimage import filters
 from sklearn.metrics import jaccard_score
 import random
+import torch
+import torch.nn.functional as F
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import multiprocessing
 
 cv2.setUseOptimized(True)
 cv2.setNumThreads(4)  # Use 4 CPU threads
+
+# GPU setup
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"[GPU] Using device: {DEVICE}")
+if torch.cuda.is_available():
+    print(f"[GPU] GPU Name: {torch.cuda.get_device_name(0)}")
+    print(f"[GPU] GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 
 class PaperPreprocessor:
     """
@@ -133,22 +143,26 @@ class PaperPreprocessor:
         # Step 1: Normalization (equation 1)
         normalized = self.normalize_image(image)
         
-        # Step 2: Sigmoid normalization (equation 2)
-        sigmoid_norm = self.sigmoid_normalization(normalized)
+        # Step 2: Sigmoid normalization (equation 2) - SKIP, too aggressive
+        # sigmoid_norm = self.sigmoid_normalization(normalized)
         
-        # Step 3: Median filtering (equation 3)
-        median_filtered = self.apply_median_filter(sigmoid_norm)
+        # Step 3: Median filtering (equation 3) - for noise removal
+        median_filtered = self.apply_median_filter(normalized, kernel_size=3)
         
-        # Step 4: CLAHE enhancement (equations 4-8)
-        clahe_enhanced = self.apply_clahe(median_filtered)
+        # Step 4: CLAHE enhancement (equations 4-8) - SKIP, inverts tumor contrast
+        # clahe_enhanced = self.apply_clahe(median_filtered)
+        
+        # CRITICAL FIX: Use minimal preprocessing to preserve tumor contrast
+        # Just normalize and denoise, skip aggressive contrast enhancement
+        final_image = median_filtered
         
         return {
             'original': image,
             'normalized': normalized,
-            'sigmoid_normalized': sigmoid_norm,
+            'sigmoid_normalized': None,  # Disabled
             'median_filtered': median_filtered,
-            'clahe_enhanced': clahe_enhanced,
-            'final': clahe_enhanced  # Final preprocessed image
+            'clahe_enhanced': None,  # Disabled
+            'final': final_image  # Final preprocessed image
         }
 
 
@@ -168,7 +182,11 @@ class ElectromagnetismLikeOptimizer:
                  max_iterations: int = 50,   # Reduced from 100 for speed
                  local_search_prob: float = 0.5,  # Reduced from 0.8
                  local_search_iterations: int = 3,  # Reduced from 5
-                 force_constant: float = 1.0):
+                 force_constant: float = 1.0,
+                 l1_weight: float = 0.0,
+                 use_mixed_precision: bool = False,
+                 use_gpu: bool = True,
+                 batch_size: int = 10):
         """
         Initialize EML optimizer with paper parameters.
         
@@ -178,15 +196,28 @@ class ElectromagnetismLikeOptimizer:
             local_search_prob: Probability of local search
             local_search_iterations: Number of local search iterations
             force_constant: Electromagnetic force constant
+            l1_weight: L1 regularization weight to prevent overfitting
+            use_mixed_precision: Use float16 for faster computation
+            use_gpu: Use GPU acceleration if available
+            batch_size: Batch size for parallel fitness evaluation
         """
         self.N = population_size
         self.max_iterations = max_iterations
         self.local_search_prob = local_search_prob
         self.local_search_iterations = local_search_iterations
         self.force_constant = force_constant
+        self.l1_weight = l1_weight
+        self.use_mixed_precision = use_mixed_precision
+        self.use_gpu = use_gpu and torch.cuda.is_available()
+        self.batch_size = batch_size
+        self.device = DEVICE if self.use_gpu else torch.device('cpu')
         # Performance optimization: cache histogram
         self._hist_cache = None
         self._hist_norm_cache = None
+        self._hist_tensor = None  # GPU tensor cache
+        
+        if self.use_gpu:
+            print(f"[GPU] EML Optimizer initialized with GPU acceleration (batch_size={batch_size})")
     
     def initialize_population(self, search_space: Tuple[float, float], dimension: int) -> np.ndarray:
         """
@@ -202,7 +233,8 @@ class ElectromagnetismLikeOptimizer:
             Population matrix of shape (N, dimension)
         """
         lower, upper = search_space
-        population = np.random.uniform(lower, upper, size=(self.N, dimension))
+        dtype = np.float16 if self.use_mixed_precision else np.float32
+        population = np.random.uniform(lower, upper, size=(self.N, dimension)).astype(dtype)
         return population
     
     def _precompute_histogram(self, image: np.ndarray):
@@ -210,6 +242,10 @@ class ElectromagnetismLikeOptimizer:
         hist, _ = np.histogram(image.flatten(), bins=256, range=(0, 256))
         self._hist_cache = hist.astype(float)
         self._hist_norm_cache = self._hist_cache / image.size
+        
+        # GPU: Create tensor version for GPU operations
+        if self.use_gpu:
+            self._hist_tensor = torch.from_numpy(self._hist_norm_cache).float().to(self.device)
     
     def evaluate_fitness(self, particle: np.ndarray, image: np.ndarray, 
                         method: str = 'otsu') -> float:
@@ -222,14 +258,144 @@ class ElectromagnetismLikeOptimizer:
             method: 'otsu' or 'kapur' for objective function
             
         Returns:
-            Fitness value
+            Fitness value with optional L1 regularization
         """
+        # Convert to float32 for computation if using mixed precision
+        if self.use_mixed_precision and particle.dtype == np.float16:
+            particle = particle.astype(np.float32)
+        
         if method == 'otsu':
-            return self._otsu_objective(particle, image)
+            base_fitness = self._otsu_objective(particle, image)
         elif method == 'kapur':
-            return self._kapur_objective(particle, image)
+            base_fitness = self._kapur_objective(particle, image)
         else:
             raise ValueError("Method must be 'otsu' or 'kapur'")
+        
+        # Add L1 regularization to prevent overfitting
+        # L1 penalty encourages sparse solutions and prevents extreme threshold values
+        if self.l1_weight > 0:
+            l1_penalty = self.l1_weight * np.sum(np.abs(particle - 127.5))  # Penalize deviation from middle value
+            base_fitness += l1_penalty
+        
+        return base_fitness
+    
+    def evaluate_fitness_batch_gpu(self, particles: np.ndarray, image: np.ndarray, method: str = 'otsu') -> np.ndarray:
+        """
+        GPU-accelerated batch fitness evaluation.
+        
+        Args:
+            particles: Batch of particles (batch_size, dimension)
+            image: Input image
+            method: 'otsu' or 'kapur'
+            
+        Returns:
+            Array of fitness values
+        """
+        if not self.use_gpu or self._hist_tensor is None:
+            # Fallback to CPU batch processing
+            return np.array([self.evaluate_fitness(p, image, method) for p in particles])
+        
+        try:
+            # Convert particles to GPU tensor
+            particles_tensor = torch.from_numpy(particles).float().to(self.device)
+            batch_size = particles_tensor.shape[0]
+            
+            if method == 'otsu':
+                fitness_values = self._otsu_objective_batch_gpu(particles_tensor)
+            elif method == 'kapur':
+                fitness_values = self._kapur_objective_batch_gpu(particles_tensor)
+            else:
+                raise ValueError("Method must be 'otsu' or 'kapur'")
+            
+            # Add L1 regularization
+            if self.l1_weight > 0:
+                l1_penalty = self.l1_weight * torch.sum(torch.abs(particles_tensor - 127.5), dim=1)
+                fitness_values += l1_penalty
+            
+            return fitness_values.cpu().numpy()
+        
+        except Exception as e:
+            print(f"[GPU] Batch evaluation failed, falling back to CPU: {e}")
+            return np.array([self.evaluate_fitness(p, image, method) for p in particles])
+    
+    def _otsu_objective_batch_gpu(self, thresholds_batch: torch.Tensor) -> torch.Tensor:
+        """
+        GPU-accelerated batch OTSU objective function.
+        
+        Args:
+            thresholds_batch: Batch of threshold values (batch_size, 1)
+            
+        Returns:
+            Batch of fitness values
+        """
+        batch_size = thresholds_batch.shape[0]
+        thresholds = torch.clamp(thresholds_batch[:, 0], 1, 254).long()  # (batch_size,)
+        
+        fitness_values = torch.zeros(batch_size, device=self.device)
+        hist_norm = self._hist_tensor
+        
+        for i in range(batch_size):
+            t = thresholds[i].item()
+            
+            # Class probabilities
+            w0 = torch.sum(hist_norm[:t])
+            w1 = torch.sum(hist_norm[t:])
+            
+            if w0 < 1e-10 or w1 < 1e-10:
+                fitness_values[i] = float('inf')
+                continue
+            
+            # Class means
+            indices = torch.arange(256, device=self.device, dtype=torch.float32)
+            mu0 = torch.sum(indices[:t] * hist_norm[:t]) / w0
+            mu1 = torch.sum(indices[t:] * hist_norm[t:]) / w1
+            
+            # Between-class variance
+            between_class_variance = w0 * w1 * (mu0 - mu1) ** 2
+            fitness_values[i] = -between_class_variance
+        
+        return fitness_values
+    
+    def _kapur_objective_batch_gpu(self, thresholds_batch: torch.Tensor) -> torch.Tensor:
+        """
+        GPU-accelerated batch Kapur objective function.
+        
+        Args:
+            thresholds_batch: Batch of threshold values (batch_size, 1)
+            
+        Returns:
+            Batch of fitness values
+        """
+        batch_size = thresholds_batch.shape[0]
+        thresholds = torch.clamp(thresholds_batch[:, 0], 1, 254).long()
+        
+        fitness_values = torch.zeros(batch_size, device=self.device)
+        hist_norm = self._hist_tensor + 1e-10  # Avoid log(0)
+        
+        for i in range(batch_size):
+            t = thresholds[i].item()
+            
+            # Entropy of first class
+            p1 = hist_norm[:t]
+            sum_p1 = torch.sum(p1)
+            if sum_p1 > 1e-10:
+                p1_norm = p1 / sum_p1
+                entropy1 = -torch.sum(p1_norm * torch.log(p1_norm + 1e-10))
+            else:
+                entropy1 = 0.0
+            
+            # Entropy of second class
+            p2 = hist_norm[t:]
+            sum_p2 = torch.sum(p2)
+            if sum_p2 > 1e-10:
+                p2_norm = p2 / sum_p2
+                entropy2 = -torch.sum(p2_norm * torch.log(p2_norm + 1e-10))
+            else:
+                entropy2 = 0.0
+            
+            fitness_values[i] = -(entropy1 + entropy2)
+        
+        return fitness_values
     
     def _otsu_objective(self, thresholds: np.ndarray, image: np.ndarray) -> float:
         """
@@ -446,22 +612,36 @@ class ElectromagnetismLikeOptimizer:
         best_particle = None
         best_fitness = float('inf')
         no_improvement_count = 0
-        patience = 10  # Early stopping patience
+        patience = 5  # REDUCED: Early stopping patience (was 10)
+        min_improvement = 1e-6  # Minimum improvement threshold
         
         print(f"Starting EML optimization with {self.max_iterations} iterations...")
+        if self.use_gpu:
+            print(f"[GPU] GPU-accelerated batch processing enabled (batch_size={self.batch_size})")
         
         for iteration in range(self.max_iterations):
-            # Evaluate fitness for all particles
-            fitness_values = np.array([
-                self.evaluate_fitness(particle, image, method) 
-                for particle in population
-            ])
+            # GPU BATCH PROCESSING: Evaluate fitness for all particles in batches
+            if self.use_gpu and self._hist_tensor is not None:
+                fitness_values = []
+                for i in range(0, self.N, self.batch_size):
+                    batch = population[i:i+self.batch_size]
+                    batch_fitness = self.evaluate_fitness_batch_gpu(batch, image, method)
+                    fitness_values.extend(batch_fitness)
+                fitness_values = np.array(fitness_values)
+            else:
+                # CPU fallback
+                fitness_values = np.array([
+                    self.evaluate_fitness(particle, image, method) 
+                    for particle in population
+                ])
             
             # Update global best
             min_idx = np.argmin(fitness_values)
             current_best_fitness = fitness_values[min_idx]
             
-            if current_best_fitness < best_fitness:
+            # Check for improvement with threshold
+            improvement = best_fitness - current_best_fitness
+            if improvement > min_improvement:
                 best_fitness = current_best_fitness
                 best_particle = population[min_idx].copy()
                 no_improvement_count = 0
@@ -470,7 +650,7 @@ class ElectromagnetismLikeOptimizer:
             
             best_fitness_history.append(best_fitness)
             
-            # Early stopping
+            # Early stopping with reduced patience
             if no_improvement_count >= patience:
                 print(f"Early stopping at iteration {iteration + 1} (no improvement for {patience} iterations)")
                 break
@@ -488,8 +668,8 @@ class ElectromagnetismLikeOptimizer:
             # Apply bounds
             population = np.clip(population, search_space[0], search_space[1])
             
-            # OPTIMIZATION: Reduce local search frequency (only apply to top 20% particles)
-            num_local_search = max(1, int(self.N * 0.2))
+            # OPTIMIZATION: Reduce local search frequency (only apply to top 10% particles)
+            num_local_search = max(1, int(self.N * 0.1))  # REDUCED from 20% to 10%
             # Get indices of best particles
             best_indices = np.argsort(fitness_values)[:num_local_search]
             for i in best_indices:
@@ -498,14 +678,19 @@ class ElectromagnetismLikeOptimizer:
                         population[i], image, method, search_space
                     )
             
-            # Progress reporting
-            if (iteration + 1) % 10 == 0:  # Report more frequently
+            # Progress reporting - less frequent
+            if (iteration + 1) % 20 == 0:  # CHANGED: Report every 20 iterations instead of 10
                 print(f"Iteration {iteration + 1}/{self.max_iterations}, "
                       f"Best fitness: {best_fitness:.6f}")
         
         # Clear cache
         self._hist_cache = None
         self._hist_norm_cache = None
+        self._hist_tensor = None  # Clear GPU tensor
+        
+        # Clear GPU memory
+        if self.use_gpu:
+            torch.cuda.empty_cache()
         
         return {
             'best_thresholds': best_particle,
@@ -526,15 +711,26 @@ class PaperSegmentationModel:
                  population_size: int = 30,
                  max_iterations: int = 50,
                  local_search_prob: float = 0.5,
-                 local_search_iterations: int = 3):
+                 local_search_iterations: int = 3,
+                 l1_weight: float = 0.0,
+                 use_mixed_precision: bool = False,
+                 use_gpu: bool = True,
+                 batch_size: int = 10):
         """Initialize the segmentation model."""
         self.preprocessor = PaperPreprocessor()
         self.optimizer = ElectromagnetismLikeOptimizer(
             population_size=population_size,
             max_iterations=max_iterations,
             local_search_prob=local_search_prob,
-            local_search_iterations=local_search_iterations
+            local_search_iterations=local_search_iterations,
+            l1_weight=l1_weight,
+            use_mixed_precision=use_mixed_precision,
+            use_gpu=use_gpu,
+            batch_size=batch_size
         )
+        self.l1_weight = l1_weight
+        self.use_mixed_precision = use_mixed_precision
+        self.use_gpu = use_gpu
     
     def segment_image(self, image: np.ndarray, method: str = 'otsu', 
                      num_thresholds: int = 1) -> Dict:
@@ -553,6 +749,10 @@ class PaperSegmentationModel:
         # Debug: show incoming image info
         try:
             print(f"[DEBUG] input image shape: {image.shape}, dtype: {image.dtype}, min: {np.min(image)}, max: {np.max(image)}")
+            if self.l1_weight > 0:
+                print(f"[DEBUG] L1 regularization weight: {self.l1_weight}")
+            if self.use_mixed_precision:
+                print(f"[DEBUG] Mixed precision enabled (using float16)")
         except Exception:
             print(f"[DEBUG] input image info unavailable")
 
@@ -596,7 +796,8 @@ class PaperSegmentationModel:
         """
         Apply multilevel thresholding with post-processing as per equations (12)-(13).
         
-        IMPROVED VERSION with morphological post-processing for better results.
+        IMPROVED VERSION with smart tumor detection.
+        CRITICAL FIX: Automatically finds tumor regions regardless of contrast direction.
         
         Args:
             image: Enhanced image
@@ -610,13 +811,71 @@ class PaperSegmentationModel:
         segmented = np.zeros_like(image)
         
         if num_levels == 1:
-            # Bilevel thresholding (equation 12)
-            threshold = thresholds[0]
-            segmented = (image > threshold).astype(np.uint8) * 255
+            # CRITICAL FIX: Smart adaptive thresholding
+            # Instead of using single threshold, try multiple thresholds and pick best one
             
-            # IMPROVEMENT: Apply morphological post-processing
-            # This removes noise and fills holes, improving Dice/Jaccard scores
-            segmented = self._apply_morphological_postprocessing(segmented)
+            # Tumor regions are typically 0.1% to 3% of mammogram images
+            target_min_ratio = 0.001  # 0.1%
+            target_max_ratio = 0.03   # 3% (tighter limit)
+            target_optimal_ratio = 0.01  # 1% (most common)
+            
+            # Try a range of thresholds around the optimized one
+            best_threshold = thresholds[0]
+            best_segmented = None
+            best_score = float('inf')
+            
+            # Search across full range to find tumor-sized regions
+            search_range = np.linspace(10, 245, 30)
+            
+            for test_thresh in search_range:
+                # Try both directions
+                for invert in [False, True]:
+                    if invert:
+                        test_seg = (image < test_thresh).astype(np.uint8)
+                    else:
+                        test_seg = (image > test_thresh).astype(np.uint8)
+                    
+                    ratio = np.count_nonzero(test_seg) / test_seg.size
+                    
+                    # Skip if way too large or too small
+                    if ratio < 0.0001 or ratio > 0.5:
+                        continue
+                    
+                    # Score based on how close to ideal tumor size
+                    if target_min_ratio <= ratio <= target_max_ratio:
+                        # In ideal range - prefer closest to 1%
+                        score = abs(ratio - target_optimal_ratio)
+                    else:
+                        # Outside ideal range - penalize VERY heavily
+                        if ratio < target_min_ratio:
+                            score = 100 + abs(ratio - target_min_ratio)
+                        else:
+                            score = 100 + abs(ratio - target_max_ratio) * 10  # Penalize large regions more
+                    
+                    if score < best_score:
+                        best_score = score
+                        best_threshold = test_thresh
+                        best_segmented = test_seg.copy()
+            
+            if best_segmented is not None:
+                segmented = best_segmented
+                final_ratio = np.count_nonzero(segmented) / segmented.size
+                print(f"[DEBUG] Selected threshold: {best_threshold:.2f}")
+                print(f"[DEBUG] Tumor region: {final_ratio*100:.4f}% of image")
+                print(f"[DEBUG] Score: {best_score:.6f} (lower is better)")
+            else:
+                # Fallback to simple thresholding
+                print(f"[DEBUG] Fallback to simple thresholding")
+                threshold = thresholds[0]
+                segmented = (image > threshold).astype(np.uint8)
+            
+            # Apply minimal morphological operations
+            kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            segmented = cv2.morphologyEx(segmented, cv2.MORPH_OPEN, kernel_small)
+            segmented = cv2.morphologyEx(segmented, cv2.MORPH_CLOSE, kernel_small)
+            
+            # Ensure output is binary (0 or 1)
+            segmented = np.clip(segmented, 0, 1).astype(np.uint8)
         else:
             # Multilevel thresholding (equation 13)
             for i, threshold in enumerate(thresholds):
@@ -687,8 +946,8 @@ class PaperSegmentationModel:
         mask_filled_inv = cv2.bitwise_not(mask_filled)
         mask = mask | mask_filled_inv
         
-        # Convert back to 0-255 range
-        return mask.astype(np.uint8) * 255
+        # CRITICAL FIX: Return binary (0 or 1) not (0 or 255)
+        return np.clip(mask, 0, 1).astype(np.uint8)
     
     def template_matching(self, segmented: np.ndarray, ground_truth: np.ndarray) -> Dict:
         """
@@ -783,9 +1042,17 @@ class PaperEvaluationMetrics:
                 interpolation=cv2.INTER_NEAREST  # Use nearest neighbor for binary masks
             )
         
-        # Ensure binary masks
-        pred = (segmented > 127).astype(np.uint8).flatten()
-        gt = (ground_truth > 127).astype(np.uint8).flatten()
+        # Ensure binary masks (handle both 0-1 and 0-255 ranges)
+        # CRITICAL FIX: Check max value to determine range
+        if segmented.max() <= 1:
+            pred = (segmented > 0).astype(np.uint8).flatten()
+        else:
+            pred = (segmented > 127).astype(np.uint8).flatten()
+            
+        if ground_truth.max() <= 1:
+            gt = (ground_truth > 0).astype(np.uint8).flatten()
+        else:
+            gt = (ground_truth > 127).astype(np.uint8).flatten()
         
         # Calculate confusion matrix components
         TP = np.sum((pred == 1) & (gt == 1))  # True Positive

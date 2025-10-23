@@ -18,6 +18,8 @@ import json
 from datetime import datetime
 import pickle
 import shutil
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import multiprocessing
 
 cv2.setUseOptimized(True)
 cv2.setNumThreads(4)  # Use 4 CPU threads
@@ -102,7 +104,12 @@ class PaperDatasetProcessor:
                  population_size: int = 30,
                  max_iterations: int = 50,
                  local_search_prob: float = 0.5,
-                 local_search_iterations: int = 3):
+                 local_search_iterations: int = 3,
+                 l1_weight: float = 0.0,
+                 use_mixed_precision: bool = False,
+                 use_gpu: bool = True,
+                 batch_size: int = 10,
+                 num_workers: int = 1):
         """
         Initialize with dataset CSV file.
         
@@ -113,13 +120,30 @@ class PaperDatasetProcessor:
             max_iterations: EML optimizer max iterations
             local_search_prob: EML local search probability
             local_search_iterations: EML local search iterations
+            l1_weight: L1 regularization weight to prevent overfitting (default: 0.0)
+            use_mixed_precision: Use float16 for faster computation (default: False)
+            use_gpu: Use GPU acceleration if available (default: True)
+            batch_size: Batch size for GPU processing (default: 10)
+            num_workers: Number of parallel workers for image processing (default: 1, use 0 for auto)
         """
         self.df = pd.read_csv(dataset_csv)
+        self.l1_weight = l1_weight
+        self.use_mixed_precision = use_mixed_precision
+        self.use_gpu = use_gpu
+        self.batch_size = batch_size
+        self.num_workers = num_workers if num_workers > 0 else max(1, multiprocessing.cpu_count() - 1)
+        
+        print(f"[PARALLEL] Using {self.num_workers} workers for parallel processing")
+        
         self.model = PaperSegmentationModel(
             population_size=population_size,
             max_iterations=max_iterations,
             local_search_prob=local_search_prob,
-            local_search_iterations=local_search_iterations
+            local_search_iterations=local_search_iterations,
+            l1_weight=l1_weight,
+            use_mixed_precision=use_mixed_precision,
+            use_gpu=use_gpu,
+            batch_size=batch_size
         )
         self.metrics_calculator = PaperEvaluationMetrics()
         
@@ -131,25 +155,43 @@ class PaperDatasetProcessor:
         self.best_dice = -1
         self.best_model = None
         
-        # Detect column names adaptively
+        # Detect column names adaptively with preference for complete data
         columns = self.df.columns.tolist()
         print(f"Available columns: {columns}")
         
-        # Detect image column
-        self.image_column = get_image_column_name(columns, debug=True)
+        # Detect image column - prefer columns with complete data
+        image_candidates = [col for col in columns if any(
+            pattern in col.lower() for pattern in ['image', 'file_path', 'fullpath', 'filename']
+        )]
+        # Sort by missing value count (ascending) and then by preference
+        image_candidates_sorted = sorted(image_candidates, 
+                                        key=lambda c: (self.df[c].isnull().sum(), 
+                                                      0 if 'file_path' in c.lower() else 1))
+        
+        self.image_column = image_candidates_sorted[0] if image_candidates_sorted else get_image_column_name(columns, debug=True)
         if self.image_column is None:
             raise ValueError(f"Could not detect image column in: {columns}")
-        print(f"Using image column: {self.image_column}")
         
-        # Detect mask columns
-        self.mask_columns = get_mask_column_names(columns, debug=True)
+        missing_imgs = self.df[self.image_column].isnull().sum()
+        print(f"Using image column: {self.image_column} ({missing_imgs} missing, {(1 - missing_imgs/len(self.df))*100:.1f}% complete)")
+        
+        # Detect mask columns - prefer columns with complete data
+        mask_candidates = [col for col in columns if any(
+            pattern in col.lower() for pattern in ['mask', 'roi']
+        )]
+        mask_candidates_sorted = sorted(mask_candidates,
+                                       key=lambda c: (self.df[c].isnull().sum(),
+                                                     0 if 'roi' in c.lower() else 1))
+        
+        self.mask_columns = mask_candidates_sorted if mask_candidates_sorted else get_mask_column_names(columns, debug=True)
         if not self.mask_columns:
             raise ValueError(f"Could not detect mask columns in: {columns}")
-        print(f"Using mask columns: {self.mask_columns}")
         
         # Use the first mask column as primary
         self.mask_column = self.mask_columns[0]
-        print(f"Primary mask column: {self.mask_column}")
+        missing_masks = self.df[self.mask_column].isnull().sum()
+        print(f"Using mask column: {self.mask_column} ({missing_masks} missing, {(1 - missing_masks/len(self.df))*100:.1f}% complete)")
+        print(f"Available mask columns: {self.mask_columns}")
         
     def process_single_image(self, image_path: str, mask_path: str, 
                            method: str = 'otsu') -> Dict:
@@ -165,6 +207,12 @@ class PaperDatasetProcessor:
             Processing results including metrics
         """
         try:
+            # Handle NaN or invalid paths from CSV
+            if pd.isna(image_path) or not isinstance(image_path, str) or not image_path.strip():
+                raise ValueError(f"Invalid or missing image path: {image_path}")
+            if pd.isna(mask_path) or not isinstance(mask_path, str) or not mask_path.strip():
+                raise ValueError(f"Invalid or missing mask path: {mask_path}")
+            
             # Load image using adaptive loading
             image, actual_image_path = load_image_adaptive(image_path, debug=False)
             if image is None:
@@ -177,6 +225,14 @@ class PaperDatasetProcessor:
             # 1) Try direct adaptive load first
             if isinstance(mask_path, str) and mask_path.strip():
                 mask, actual_mask_path = load_image_adaptive(mask_path, debug=False)
+                
+                # CRITICAL FIX: Normalize mask to binary (0 or 1)
+                if mask is not None:
+                    # If mask has values > 1, it's likely 0-255 format, convert to 0-1
+                    if mask.max() > 1:
+                        mask = (mask > 127).astype(np.uint8)  # Threshold at 127 to get binary mask
+                    # Ensure mask is exactly 0 or 1
+                    mask = np.clip(mask, 0, 1).astype(np.uint8)
 
             # 2) If not found, try splitting multiple mask entries and load/merge
             if mask is None and isinstance(mask_path, str):
@@ -203,6 +259,12 @@ class PaperDatasetProcessor:
                         # Use _merge_mask_files which expects list of paths
                         mask = _merge_mask_files(mask_list, image.shape, debug=False)
                         actual_mask_path = ','.join(mask_list)
+                        
+                        # CRITICAL FIX: Normalize merged mask to binary
+                        if mask is not None:
+                            if mask.max() > 1:
+                                mask = (mask > 127).astype(np.uint8)
+                            mask = np.clip(mask, 0, 1).astype(np.uint8)
 
             # 3) If still not found, try resolving single mask path relative to image dir
             if mask is None and isinstance(mask_path, str) and mask_path.strip():
@@ -210,6 +272,11 @@ class PaperDatasetProcessor:
                 resolved = _resolve_mask_path(mask_path, img_dir)
                 if resolved:
                     mask, actual_mask_path = load_image_adaptive(resolved, debug=False)
+                    # CRITICAL FIX: Normalize mask
+                    if mask is not None:
+                        if mask.max() > 1:
+                            mask = (mask > 127).astype(np.uint8)
+                        mask = np.clip(mask, 0, 1).astype(np.uint8)
 
             # 4) Final fallback: if mask still None but mask_path is empty/None, create empty mask
             if mask is None:
@@ -220,6 +287,11 @@ class PaperDatasetProcessor:
                 # Create an empty mask of same shape to allow segmentation and measurement (will yield zero metrics)
                 mask = np.zeros_like(image)
                 actual_mask_path = None
+            
+            # CRITICAL FIX: Ensure mask matches image dimensions
+            if mask.shape != image.shape:
+                print(f"[WARNING] Mask shape {mask.shape} != Image shape {image.shape}, resizing mask...")
+                mask = cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
 
             # Apply paper's segmentation methodology
             segmentation_results = self.model.segment_image(
@@ -653,17 +725,38 @@ def main():
     parser.add_argument('--checkpoint-interval', type=int, default=10,
                        help='Save checkpoint every N images (default: 10)')
     
+    parser.add_argument('--no-resume', action='store_true',
+                       help='Do not resume from checkpoint (start fresh)')
+    
     parser.add_argument('--population-size', type=int, default=30,
                        help='EML optimizer population size (default: 30, reduced for speed)')
     
-    parser.add_argument('--max-iterations', type=int, default=50,
-                       help='EML optimizer max iterations (default: 50, reduced for speed)')
+    parser.add_argument('--max-iterations', type=int, default=30,
+                       help='EML optimizer max iterations (default: 30 for speed, original paper uses 100)')
     
     parser.add_argument('--local-search-prob', type=float, default=0.5,
                        help='EML local search probability (default: 0.5)')
     
     parser.add_argument('--local-search-iterations', type=int, default=3,
                        help='EML local search iterations (default: 3)')
+    
+    parser.add_argument('--l1-weight', type=float, default=0.0,
+                       help='L1 regularization weight to prevent overfitting (default: 0.0, suggested: 1e-4 to 1e-5)')
+    
+    parser.add_argument('--mixed-precision', action='store_true',
+                       help='Use mixed precision (float16) for faster computation')
+    
+    parser.add_argument('--use-gpu', action='store_true', default=True,
+                       help='Use GPU acceleration if available (default: True)')
+    
+    parser.add_argument('--no-gpu', action='store_true',
+                       help='Disable GPU acceleration')
+    
+    parser.add_argument('--batch-size', type=int, default=10,
+                       help='Batch size for GPU processing (default: 10)')
+    
+    parser.add_argument('--num-workers', type=int, default=1,
+                       help='Number of parallel workers (default: 1, use 0 for auto-detect)')
     
     args = parser.parse_args()
     
@@ -683,6 +776,12 @@ def main():
     print(f"Checkpoint directory: {args.checkpoint_dir}")
     print(f"Checkpoint interval: {args.checkpoint_interval} images")
     print(f"Resume from checkpoint: {not args.no_resume}")
+    print(f"L1 regularization weight: {args.l1_weight}")
+    print(f"Mixed precision: {args.mixed_precision}")
+    print(f"GPU acceleration: {args.use_gpu and not args.no_gpu}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Parallel workers: {args.num_workers}")
+    print(f"Max iterations: {args.max_iterations}")
     print("=" * 60)
     
     # Initialize processor with checkpoint directory
@@ -691,7 +790,12 @@ def main():
                                      population_size=args.population_size,
                                      max_iterations=args.max_iterations,
                                      local_search_prob=args.local_search_prob,
-                                     local_search_iterations=args.local_search_iterations)
+                                     local_search_iterations=args.local_search_iterations,
+                                     l1_weight=args.l1_weight,
+                                     use_mixed_precision=args.mixed_precision,
+                                     use_gpu=args.use_gpu and not args.no_gpu,
+                                     batch_size=args.batch_size,
+                                     num_workers=args.num_workers)
     
     # Process dataset with checkpointing
     results = processor.process_dataset(
